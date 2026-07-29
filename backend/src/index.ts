@@ -23,6 +23,9 @@ import productRoutes from './routes/products.js';
 import dashboardRoutes from './routes/dashboard.js';
 import syncRoutes from './routes/sync.js';
 import adminRoutes from './routes/admin.js';
+import { readFileSync, existsSync } from 'fs';
+import { fileURLToPath } from 'url';
+import { dirname, join, extname } from 'path';
 
 // =============================================
 // LOGGER (Pino)
@@ -109,6 +112,44 @@ adminApi.route('/', adminRoutes);
 api.route('/', adminApi);
 
 app.route('/api', api);
+
+// =============================================
+// FRONTEND STATIC FILES
+// =============================================
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const STATIC_DIR = join(__dirname, '../../frontend/public');
+const INDEX_HTML = readFileSync(join(STATIC_DIR, 'index.html'), 'utf-8');
+
+const MIME: Record<string, string> = {
+  '.html': 'text/html',
+  '.js': 'application/javascript',
+  '.css': 'text/css',
+  '.json': 'application/manifest+json',
+  '.png': 'image/png',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.webp': 'image/webp',
+};
+
+app.get('/*', async (c) => {
+  const path = c.req.path;
+
+  if (path === '/') {
+    return c.html(INDEX_HTML);
+  }
+
+  const filePath = join(STATIC_DIR, path);
+  if (existsSync(filePath)) {
+    const ext = extname(filePath);
+    const content = readFileSync(filePath);
+    return c.body(content, 200, {
+      'Content-Type': MIME[ext] || 'application/octet-stream',
+    });
+  }
+
+  return c.html(INDEX_HTML);
+});
 
 // =============================================
 // 404 HANDLER
