@@ -1,0 +1,5362 @@
+﻿
+FILE: package.json
+
+================================================================================
+{
+  "name": "mini-market-price-checker-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "db:push": "drizzle-kit push",
+    "db:studio": "drizzle-kit studio"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.14.0",
+    "bcrypt": "^5.1.1",
+    "dotenv": "^16.4.0",
+    "drizzle-orm": "^0.38.0",
+    "fast-xml-parser": "^4.5.0",
+    "hono": "^4.7.0",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.13.0",
+    "pino": "^9.6.0",
+    "pino-pretty": "^13.0.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/bcrypt": "^5.0.2",
+    "@types/jsonwebtoken": "^9.0.7",
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.11.0",
+    "drizzle-kit": "^0.30.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
+
+FILE: tsconfig.json
+
+================================================================================
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}
+
+FILE: drizzle.config.ts
+
+================================================================================
+import { defineConfig } from 'drizzle-kit';
+
+export default defineConfig({
+  schema: './src/db/schema.ts',
+  out: './drizzle',
+  dialect: 'postgresql',
+  dbCredentials: {
+    url: process.env.DATABASE_URL!,
+  },
+});
+
+FILE: .env.example
+
+================================================================================
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/mini_market
+JWT_SECRET=your-super-secret-key-change-me-in-production
+PORT=3000
+NODE_ENV=development
+RATE_LIMIT_PUBLIC=60
+RATE_LIMIT_SYNC=5
+FRONTEND_URL=http://localhost:5173
+
+FILE: sql/functions.sql
+
+================================================================================
+-- =============================================
+-- FUNCTION: Increment version (cache invalidation)
+-- =============================================
+CREATE OR REPLACE FUNCTION increment_version(p_store_id INTEGER)
+RETURNS VOID AS $$
+BEGIN
+  UPDATE stores SET version = version + 1, updated_at = NOW() WHERE id = p_store_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- =============================================
+-- FUNCTION: Auto-expire stores (run via cron)
+-- =============================================
+CREATE OR REPLACE FUNCTION auto_expire_stores()
+RETURNS VOID AS $$
+BEGIN
+  UPDATE stores
+  SET is_active = FALSE
+  WHERE expires_at < NOW() AND is_active = TRUE;
+END;
+$$ LANGUAGE plpgsql;
+
+FILE: src/index.ts
+
+================================================================================
+import 'dotenv/config';
+
+// Validate required environment variables
+const requiredEnvVars = ['DATABASE_URL', 'JWT_SECRET'];
+for (const key of requiredEnvVars) {
+  if (!process.env[key]) {
+    throw new Error(`Missing required environment variable: ${key}`);
+  }
+}
+
+import { Hono } from 'hono';
+import { cors } from 'hono/cors';
+import { logger } from 'hono/logger';
+import { secureHeaders } from 'hono/secure-headers';
+import { rateLimit } from './middleware/rate-limit.js';
+import { serve } from '@hono/node-server';
+import pino from 'pino';
+import { successResponse, errorResponse } from './utils/response.js';
+import { verifyJwt } from './middleware/auth.js';
+import authRoutes from './routes/auth.js';
+import storeRoutes from './routes/stores.js';
+import productRoutes from './routes/products.js';
+import dashboardRoutes from './routes/dashboard.js';
+import syncRoutes from './routes/sync.js';
+import adminRoutes from './routes/admin.js';
+
+// =============================================
+// LOGGER (Pino)
+// =============================================
+const pinoLogger = pino({
+  level: process.env.NODE_ENV === 'production' ? 'info' : 'debug',
+  transport:
+    process.env.NODE_ENV !== 'production'
+      ? { target: 'pino-pretty', options: { colorize: true } }
+      : undefined,
+});
+
+// =============================================
+// HONO APP
+// =============================================
+const app = new Hono();
+
+// =============================================
+// MIDDLEWARE CHAIN
+// =============================================
+
+// 1. Request logging (Hono built-in, feeds to Pino)
+app.use('*', logger((str) => pinoLogger.info(str)));
+
+// 2. Security headers
+app.use('*', secureHeaders());
+
+// 3. CORS
+app.use('*', cors({
+  origin: process.env.NODE_ENV === 'production'
+    ? [process.env.FRONTEND_URL || 'https://yourdomain.com']
+    : ['http://localhost:3000', 'http://localhost:5173'],
+  allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
+}));
+
+// 4. Rate limiting - Public routes (60 req/min)
+app.use('/api/*', rateLimit(60 * 1000, parseInt(process.env.RATE_LIMIT_PUBLIC || '60')));
+
+// 5. Rate limiting - Sync/Upload routes (5 req/min)
+app.use('/api/v1/sync/*', rateLimit(60 * 1000, parseInt(process.env.RATE_LIMIT_SYNC || '5')));
+
+// =============================================
+// HEALTH CHECK
+// =============================================
+app.get('/health', (c) => {
+  return c.json(successResponse({ status: 'ok', uptime: process.uptime() }));
+});
+
+// =============================================
+// API ROUTES
+// =============================================
+const api = new Hono();
+
+// Auth routes (public)
+api.route('/', authRoutes);
+
+// Store routes (public)
+api.route('/', storeRoutes);
+
+// Product routes (public, but bulk requires QR token)
+api.route('/', productRoutes);
+
+// Protected routes (JWT required)
+const protectedApi = new Hono();
+protectedApi.use('*', verifyJwt);
+
+// Protected - Sync routes
+protectedApi.route('/', syncRoutes);
+
+// Protected - Dashboard
+protectedApi.route('/', dashboardRoutes);
+
+// Protected - Product update
+protectedApi.put('/v1/products/:id', (c) => c.json(successResponse({ message: 'Not implemented yet' }), 501));
+
+api.route('/', protectedApi);
+
+// Admin routes (JWT + role: 'admin' required)
+const adminApi = new Hono();
+adminApi.use('*', verifyJwt);
+adminApi.route('/', adminRoutes);
+api.route('/', adminApi);
+
+app.route('/api', api);
+
+// =============================================
+// 404 HANDLER
+// =============================================
+app.notFound((c) => {
+  return c.json(errorResponse('Route not found', 'NOT_FOUND'), 404);
+});
+
+// =============================================
+// ERROR HANDLER
+// =============================================
+app.onError((err, c) => {
+  pinoLogger.error({ err }, 'Unhandled error');
+  return c.json(
+    errorResponse('Internal server error', 'DATABASE_ERROR'),
+    500
+  );
+});
+
+// =============================================
+// START SERVER
+// =============================================
+const port = parseInt(process.env.PORT || '3000');
+
+serve({
+  fetch: app.fetch,
+  port,
+}, (info) => {
+  pinoLogger.info(`Mini-Market API running on http://localhost:${info.port}`);
+});
+
+export default app;
+
+FILE: src/db/index.ts
+
+================================================================================
+import { drizzle } from 'drizzle-orm/node-postgres';
+import pg from 'pg';
+import * as schema from './schema.js';
+
+const { Pool } = pg;
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
+});
+
+pool.on('error', (err) => {
+  console.error('Unexpected PostgreSQL pool error:', err);
+  process.exit(1);
+});
+
+export const db = drizzle(pool, { schema });
+export { pool };
+
+FILE: src/db/schema.ts
+
+================================================================================
+import { pgTable, serial, text, integer, numeric, timestamp, boolean, uniqueIndex } from 'drizzle-orm/pg-core';
+
+// =============================================
+// STORES TABLE
+// =============================================
+export const stores = pgTable('stores', {
+  id: serial('id').primaryKey(),
+  name: text('name').notNull(),
+  slug: text('slug').unique().notNull(),
+  ownerEmail: text('owner_email').unique().notNull(),
+  ownerPhone: text('owner_phone'),
+  passwordHash: text('password_hash').notNull(),
+  version: integer('version').default(1),
+  isActive: boolean('is_active').default(true),
+  expiresAt: timestamp('expires_at'),
+  role: text('role').default('owner'),
+  createdAt: timestamp('created_at').defaultNow(),
+  updatedAt: timestamp('updated_at').defaultNow(),
+});
+
+// =============================================
+// PRODUCTS TABLE
+// =============================================
+export const products = pgTable('products', {
+  id: serial('id').primaryKey(),
+  storeId: integer('store_id').references(() => stores.id, { onDelete: 'cascade' }).notNull(),
+  barcode: text('barcode').notNull(),
+  internalRef: text('internal_ref'),
+  name: text('name'),
+  price: numeric('price', { precision: 10, scale: 2 }).notNull(),
+  oldPrice: numeric('old_price', { precision: 10, scale: 2 }),
+  unit: text('unit'),
+  updatedAt: timestamp('updated_at').defaultNow(),
+}, (table) => ({
+  uniqueStoreBarcode: uniqueIndex('idx_products_store_barcode').on(table.storeId, table.barcode),
+}));
+
+// =============================================
+// INFER TYPES
+// =============================================
+export type Store = typeof stores.$inferSelect;
+export type NewStore = typeof stores.$inferInsert;
+export type Product = typeof products.$inferSelect;
+export type NewProduct = typeof products.$inferInsert;
+
+FILE: src/middleware/auth.ts
+
+================================================================================
+import { Context, Next } from 'hono';
+import jwt from 'jsonwebtoken';
+import { errorResponse } from '../utils/response.js';
+
+export interface JwtPayload {
+  storeId: number;
+  slug: string;
+  role: string;
+  email: string;
+}
+
+// Extend Hono's context variables
+declare module 'hono' {
+  interface ContextVariableMap {
+    storeId: number;
+    slug: string;
+    role: string;
+    email: string;
+  }
+}
+
+function extractToken(c: Context): string | null {
+  const authHeader = c.req.header('Authorization');
+  if (authHeader?.startsWith('Bearer ')) {
+    return authHeader.slice(7);
+  }
+  return null;
+}
+
+export function verifyJwt(c: Context, next: Next) {
+  return (async () => {
+    const token = extractToken(c);
+
+    if (!token) {
+      return c.json(errorResponse('Missing authorization token', 'UNAUTHORIZED'), 401);
+    }
+
+    try {
+      const payload = jwt.verify(token, process.env.JWT_SECRET!) as JwtPayload;
+      c.set('storeId', payload.storeId);
+      c.set('slug', payload.slug);
+      c.set('role', payload.role);
+      c.set('email', payload.email);
+      await next();
+    } catch (err) {
+      return c.json(errorResponse('Invalid or expired token', 'UNAUTHORIZED'), 401);
+    }
+  })();
+}
+
+export function requireAdmin(c: Context, next: Next) {
+  return (async () => {
+    const role = c.get('role');
+    if (role !== 'admin') {
+      return c.json(errorResponse('Admin access required', 'FORBIDDEN'), 403);
+    }
+    await next();
+  })();
+}
+
+export function generateToken(payload: JwtPayload): string {
+  return jwt.sign(payload, process.env.JWT_SECRET!, { expiresIn: '7d' });
+}
+
+export interface QrPayload {
+  storeId: number;
+  slug: string;
+  purpose: string;
+}
+
+export function generateQrToken(payload: QrPayload): string {
+  return jwt.sign(payload, process.env.JWT_SECRET!, { expiresIn: '1h' });
+}
+
+export function verifyQrToken(token: string): QrPayload | null {
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET!) as QrPayload;
+    if (payload.purpose !== 'sync') return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+FILE: src/middleware/rate-limit.ts
+
+================================================================================
+import { Context, Next } from 'hono';
+
+interface RateLimitEntry {
+  count: number;
+  resetAt: number;
+}
+
+const stores = new Map<string, RateLimitEntry>();
+
+function getKey(c: Context, prefix: string): string {
+  const ip = c.req.header('x-forwarded-for') || c.req.header('x-real-ip') || 'unknown';
+  return `${prefix}:${ip}`;
+}
+
+export function rateLimit(windowMs: number, limit: number) {
+  const prefix = `rl:${windowMs}:${limit}`;
+  return async (c: Context, next: Next) => {
+    const key = getKey(c, prefix);
+    const now = Date.now();
+    const entry = stores.get(key);
+
+    if (!entry || now > entry.resetAt) {
+      stores.set(key, { count: 1, resetAt: now + windowMs });
+      return next();
+    }
+
+    entry.count++;
+    if (entry.count > limit) {
+      return c.json({ success: false, error: 'Too many requests', code: 'RATE_LIMITED', timestamp: new Date().toISOString() }, 429);
+    }
+
+    return next();
+  };
+}
+
+FILE: src/routes/auth.ts
+
+================================================================================
+import { Hono } from 'hono';
+import bcrypt from 'bcrypt';
+import { z } from 'zod';
+import { eq } from 'drizzle-orm';
+import { db } from '../db/index.js';
+import { stores } from '../db/schema.js';
+import { successResponse, errorResponse } from '../utils/response.js';
+import { generateToken } from '../middleware/auth.js';
+
+const auth = new Hono();
+
+// =============================================
+// VALIDATION SCHEMAS
+// =============================================
+const signupSchema = z.object({
+  email: z.string().email('Invalid email format'),
+  password: z.string().min(6, 'Password must be at least 6 characters'),
+  storeName: z.string().min(2, 'Store name must be at least 2 characters'),
+  phone: z.string().optional(),
+});
+
+const loginSchema = z.object({
+  email: z.string().email('Invalid email format'),
+  password: z.string().min(1, 'Password is required'),
+});
+
+// =============================================
+// POST /api/v1/auth/signup
+// =============================================
+auth.post('/v1/auth/signup', async (c) => {
+  try {
+    const body = await c.req.json();
+    const parsed = signupSchema.safeParse(body);
+
+    if (!parsed.success) {
+      const message = parsed.error.errors.map((e) => e.message).join(', ');
+      return c.json(errorResponse(message, 'VALIDATION_ERROR'), 400);
+    }
+
+    const { email, password, storeName, phone } = parsed.data;
+
+    // Check if email already exists
+    const existing = await db.select().from(stores).where(eq(stores.ownerEmail, email));
+    if (existing.length > 0) {
+      return c.json(errorResponse('Email already registered', 'DUPLICATE'), 409);
+    }
+
+    // Generate slug from store name
+    let slug = storeName
+      .toLowerCase()
+      .replace(/[^a-z0-9\u0600-\u06FF]+/g, '-')
+      .replace(/^-|-$/g, '');
+
+    if (!slug) {
+      slug = `store-${Date.now()}`;
+    }
+
+    // Check if slug is unique
+    const slugExists = await db.select().from(stores).where(eq(stores.slug, slug));
+    if (slugExists.length > 0) {
+      return c.json(errorResponse('Store name already taken, please choose another', 'DUPLICATE'), 409);
+    }
+
+    // Hash password
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    // Create store
+    const [newStore] = await db.insert(stores).values({
+      name: storeName,
+      slug,
+      ownerEmail: email,
+      ownerPhone: phone || null,
+      passwordHash,
+      role: 'owner',
+    }).returning({
+      id: stores.id,
+      name: stores.name,
+      slug: stores.slug,
+      ownerEmail: stores.ownerEmail,
+      role: stores.role,
+      createdAt: stores.createdAt,
+    });
+
+    // Generate JWT
+    const token = generateToken({
+      storeId: newStore.id,
+      slug: newStore.slug,
+      role: newStore.role!,
+      email: newStore.ownerEmail,
+    });
+
+    return c.json(successResponse({
+      token,
+      store: {
+        id: newStore.id,
+        name: newStore.name,
+        slug: newStore.slug,
+        email: newStore.ownerEmail,
+        role: newStore.role,
+      },
+    }), 201);
+  } catch (err) {
+    return c.json(errorResponse('Signup failed', 'DATABASE_ERROR'), 500);
+  }
+});
+
+// =============================================
+// POST /api/v1/auth/login
+// =============================================
+auth.post('/v1/auth/login', async (c) => {
+  try {
+    const body = await c.req.json();
+    const parsed = loginSchema.safeParse(body);
+
+    if (!parsed.success) {
+      const message = parsed.error.errors.map((e) => e.message).join(', ');
+      return c.json(errorResponse(message, 'VALIDATION_ERROR'), 400);
+    }
+
+    const { email, password } = parsed.data;
+
+    // Find store by email
+    const [store] = await db.select().from(stores).where(eq(stores.ownerEmail, email));
+    if (!store) {
+      return c.json(errorResponse('Invalid email or password', 'UNAUTHORIZED'), 401);
+    }
+
+    // Verify password
+    const valid = await bcrypt.compare(password, store.passwordHash);
+    if (!valid) {
+      return c.json(errorResponse('Invalid email or password', 'UNAUTHORIZED'), 401);
+    }
+
+    // Check is_active
+    if (!store.isActive) {
+      return c.json(errorResponse('Account suspended. Contact support.', 'ACCOUNT_SUSPENDED'), 403);
+    }
+
+    // Check expires_at
+    if (store.expiresAt && new Date(store.expiresAt) < new Date()) {
+      return c.json(errorResponse('Account expired. Renew your subscription.', 'ACCOUNT_EXPIRED'), 403);
+    }
+
+    // Generate JWT
+    const token = generateToken({
+      storeId: store.id,
+      slug: store.slug,
+      role: store.role!,
+      email: store.ownerEmail,
+    });
+
+    return c.json(successResponse({
+      token,
+      store: {
+        id: store.id,
+        name: store.name,
+        slug: store.slug,
+        email: store.ownerEmail,
+        role: store.role,
+      },
+    }));
+  } catch (err) {
+    return c.json(errorResponse('Login failed', 'DATABASE_ERROR'), 500);
+  }
+});
+
+export default auth;
+
+FILE: src/routes/stores.ts
+
+================================================================================
+import { Hono } from 'hono';
+import { eq } from 'drizzle-orm';
+import { db } from '../db/index.js';
+import { stores } from '../db/schema.js';
+import { successResponse, errorResponse } from '../utils/response.js';
+
+const storeRoutes = new Hono();
+
+// =============================================
+// GET /api/v1/stores/:slug
+// Public - returns store info if active and not expired
+// =============================================
+storeRoutes.get('/v1/stores/:slug', async (c) => {
+  try {
+    const slug = c.req.param('slug');
+
+    const [store] = await db.select({
+      id: stores.id,
+      name: stores.name,
+      slug: stores.slug,
+      version: stores.version,
+      isActive: stores.isActive,
+      expiresAt: stores.expiresAt,
+    }).from(stores).where(eq(stores.slug, slug));
+
+    if (!store) {
+      return c.json(errorResponse('Store not found', 'NOT_FOUND'), 404);
+    }
+
+    if (!store.isActive) {
+      return c.json(errorResponse('Store suspended. Contact support.', 'ACCOUNT_SUSPENDED'), 403);
+    }
+
+    if (store.expiresAt && new Date(store.expiresAt) < new Date()) {
+      return c.json(errorResponse('Store expired. Renew your subscription.', 'ACCOUNT_EXPIRED'), 403);
+    }
+
+    return c.json(successResponse({
+      id: store.id,
+      name: store.name,
+      slug: store.slug,
+      version: store.version,
+    }));
+  } catch (err) {
+    return c.json(errorResponse('Failed to fetch store', 'DATABASE_ERROR'), 500);
+  }
+});
+
+export default storeRoutes;
+
+FILE: src/routes/products.ts
+
+================================================================================
+import { Hono } from 'hono';
+import { eq, and } from 'drizzle-orm';
+import { db } from '../db/index.js';
+import { stores, products } from '../db/schema.js';
+import { successResponse, errorResponse } from '../utils/response.js';
+import { verifyQrToken } from '../middleware/auth.js';
+
+const productRoutes = new Hono();
+
+// =============================================
+// Helper: verify store is active (used by all product routes)
+// =============================================
+async function getActiveStore(slug: string) {
+  const [store] = await db.select().from(stores).where(eq(stores.slug, slug));
+  if (!store) return { error: 'Store not found', status: 404 as const, code: 'NOT_FOUND' as const };
+  if (!store.isActive) return { error: 'Store suspended. Contact support.', status: 403 as const, code: 'ACCOUNT_SUSPENDED' as const };
+  if (store.expiresAt && new Date(store.expiresAt) < new Date()) return { error: 'Store expired. Renew your subscription.', status: 403 as const, code: 'ACCOUNT_EXPIRED' as const };
+  return { store };
+}
+
+// =============================================
+// GET /api/v1/products/:slug
+// Public - requires QR token for bulk product listing
+// =============================================
+productRoutes.get('/v1/products/:slug', async (c) => {
+  try {
+    const slug = c.req.param('slug');
+    const token = c.req.query('token');
+
+    if (!token) {
+      return c.json(errorResponse('QR token required', 'INVALID_TOKEN'), 401);
+    }
+
+    const qrPayload = verifyQrToken(token);
+    if (!qrPayload) {
+      return c.json(errorResponse('Invalid or expired QR token', 'INVALID_TOKEN'), 401);
+    }
+
+    if (qrPayload.slug !== slug) {
+      return c.json(errorResponse('Token does not match this store', 'INVALID_TOKEN'), 401);
+    }
+
+    // Verify store is active
+    const storeCheck = await getActiveStore(slug);
+    if ('error' in storeCheck) {
+      return c.json(errorResponse(storeCheck.error!, storeCheck.code!), storeCheck.status!);
+    }
+
+    const allProducts = await db.select({
+      id: products.id,
+      barcode: products.barcode,
+      internalRef: products.internalRef,
+      name: products.name,
+      price: products.price,
+      oldPrice: products.oldPrice,
+      unit: products.unit,
+    }).from(products).where(eq(products.storeId, storeCheck.store.id));
+
+    return c.json(successResponse(allProducts));
+  } catch (err) {
+    return c.json(errorResponse('Failed to fetch products', 'DATABASE_ERROR'), 500);
+  }
+});
+
+// =============================================
+// GET /api/v1/products/:slug/:barcode
+// Public - no token required, single product lookup
+// =============================================
+productRoutes.get('/v1/products/:slug/:barcode', async (c) => {
+  try {
+    const slug = c.req.param('slug');
+    const barcode = c.req.param('barcode');
+
+    // Verify store is active
+    const storeCheck = await getActiveStore(slug);
+    if ('error' in storeCheck) {
+      return c.json(errorResponse(storeCheck.error!, storeCheck.code!), storeCheck.status!);
+    }
+
+    const [product] = await db.select({
+      id: products.id,
+      barcode: products.barcode,
+      internalRef: products.internalRef,
+      name: products.name,
+      price: products.price,
+      oldPrice: products.oldPrice,
+      unit: products.unit,
+    }).from(products).where(
+      and(
+        eq(products.storeId, storeCheck.store.id),
+        eq(products.barcode, barcode)
+      )
+    );
+
+    if (!product) {
+      return c.json(errorResponse('Product not found', 'NOT_FOUND'), 404);
+    }
+
+    return c.json(successResponse(product));
+  } catch (err) {
+    return c.json(errorResponse('Failed to fetch product', 'DATABASE_ERROR'), 500);
+  }
+});
+
+export default productRoutes;
+
+FILE: src/routes/dashboard.ts
+
+================================================================================
+import { Hono } from 'hono';
+import { eq, count, max } from 'drizzle-orm';
+import { db } from '../db/index.js';
+import { stores, products } from '../db/schema.js';
+import { successResponse, errorResponse } from '../utils/response.js';
+
+const dashboardRoutes = new Hono();
+
+// =============================================
+// GET /api/v1/dashboard/stats
+// Protected - returns store analytics for the logged-in owner
+// =============================================
+dashboardRoutes.get('/v1/dashboard/stats', async (c) => {
+  try {
+    const storeId = c.get('storeId');
+
+    const [store] = await db.select({
+      id: stores.id,
+      name: stores.name,
+      slug: stores.slug,
+      version: stores.version,
+      updatedAt: stores.updatedAt,
+    }).from(stores).where(eq(stores.id, storeId));
+
+    if (!store) {
+      return c.json(errorResponse('Store not found', 'NOT_FOUND'), 404);
+    }
+
+    const [productCount] = await db.select({
+      total: count(),
+    }).from(products).where(eq(products.storeId, storeId));
+
+    const [lastSync] = await db.select({
+      lastSync: max(products.updatedAt),
+    }).from(products).where(eq(products.storeId, storeId));
+
+    return c.json(successResponse({
+      totalProducts: productCount.total,
+      lastSync: lastSync.lastSync || null,
+      version: store.version,
+      store: {
+        id: store.id,
+        name: store.name,
+        slug: store.slug,
+      },
+    }));
+  } catch (err) {
+    return c.json(errorResponse('Failed to fetch stats', 'DATABASE_ERROR'), 500);
+  }
+});
+
+export default dashboardRoutes;
+
+FILE: src/routes/sync.ts
+
+================================================================================
+import { Hono } from 'hono';
+import { successResponse, errorResponse } from '../utils/response.js';
+import { parseXml } from '../utils/xml-parser.js';
+import { syncProducts, clearProducts } from '../utils/sync-engine.js';
+
+const sync = new Hono();
+
+const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+
+// =============================================
+// POST /api/v1/sync/upload
+// Protected - upload XML file, parse, and sync products
+// =============================================
+sync.post('/v1/sync/upload', async (c) => {
+  try {
+    const storeId = c.get('storeId');
+
+    const body = await c.req.parseBody();
+    const file = body['file'];
+
+    if (!file || !(file instanceof File)) {
+      return c.json(errorResponse('No file uploaded. Send a file with key "file".', 'VALIDATION_ERROR'), 400);
+    }
+
+    if (file.size > MAX_FILE_SIZE) {
+      return c.json(errorResponse('File too large. Maximum size is 10MB.', 'VALIDATION_ERROR'), 400);
+    }
+
+    if (!file.name.endsWith('.xml') && file.type !== 'text/xml' && file.type !== 'application/xml') {
+      return c.json(errorResponse('Invalid file type. Only XML files are accepted.', 'VALIDATION_ERROR'), 400);
+    }
+
+    const arrayBuffer = await file.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    let parseResult;
+    try {
+      parseResult = parseXml(buffer);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to parse XML file';
+      return c.json(errorResponse(message, 'PARSE_ERROR'), 400);
+    }
+
+    if (parseResult.products.length === 0) {
+      return c.json(successResponse({
+        imported: 0,
+        updated: 0,
+        new: 0,
+        skipped: parseResult.stats.total,
+        errors: parseResult.errors,
+        stats: parseResult.stats,
+      }));
+    }
+
+    const syncReport = await syncProducts(storeId, parseResult.products);
+
+    return c.json(successResponse({
+      ...syncReport,
+      errors: [...syncReport.errors, ...parseResult.errors],
+      stats: parseResult.stats,
+    }));
+  } catch (err) {
+    return c.json(errorResponse('Sync failed', 'DATABASE_ERROR'), 500);
+  }
+});
+
+// =============================================
+// POST /api/v1/sync/clear
+// Protected - clear all products for the store
+// =============================================
+sync.post('/v1/sync/clear', async (c) => {
+  try {
+    const storeId = c.get('storeId');
+    await clearProducts(storeId);
+
+    return c.json(successResponse({ message: 'All products cleared' }));
+  } catch (err) {
+    return c.json(errorResponse('Failed to clear products', 'DATABASE_ERROR'), 500);
+  }
+});
+
+export default sync;
+
+FILE: src/routes/admin.ts
+
+================================================================================
+import { Hono } from 'hono';
+import { eq, count, desc } from 'drizzle-orm';
+import { db } from '../db/index.js';
+import { stores, products } from '../db/schema.js';
+import { successResponse, errorResponse } from '../utils/response.js';
+import { requireAdmin, generateQrToken } from '../middleware/auth.js';
+
+const admin = new Hono();
+
+admin.use('*', requireAdmin);
+
+// =============================================
+// GET /v1/admin/stores
+// List all stores with product counts
+// =============================================
+admin.get('/v1/admin/stores', async (c) => {
+  try {
+    const allStores = await db
+      .select({
+        id: stores.id,
+        name: stores.name,
+        slug: stores.slug,
+        ownerEmail: stores.ownerEmail,
+        ownerPhone: stores.ownerPhone,
+        isActive: stores.isActive,
+        expiresAt: stores.expiresAt,
+        role: stores.role,
+        version: stores.version,
+        createdAt: stores.createdAt,
+      })
+      .from(stores)
+      .orderBy(desc(stores.createdAt));
+
+    const storeIds = allStores.map((s) => s.id);
+    const counts: Record<number, number> = {};
+
+    if (storeIds.length > 0) {
+      const productCounts = await db
+        .select({ storeId: products.storeId, total: count() })
+        .from(products)
+        .groupBy(products.storeId);
+
+      for (const row of productCounts) {
+        counts[row.storeId] = row.total;
+      }
+    }
+
+    const result = allStores.map((s) => ({
+      ...s,
+      productCount: counts[s.id] || 0,
+    }));
+
+    return c.json(successResponse(result));
+  } catch (err) {
+    return c.json(errorResponse('Failed to fetch stores', 'DATABASE_ERROR'), 500);
+  }
+});
+
+// =============================================
+// PUT /v1/admin/stores/:id/toggle-active
+// Toggle block/unblock a store
+// =============================================
+admin.put('/v1/admin/stores/:id/toggle-active', async (c) => {
+  try {
+    const id = parseInt(c.req.param('id'));
+    if (isNaN(id)) {
+      return c.json(errorResponse('Invalid store ID', 'VALIDATION_ERROR'), 400);
+    }
+
+    const [store] = await db.select({ isActive: stores.isActive }).from(stores).where(eq(stores.id, id));
+    if (!store) {
+      return c.json(errorResponse('Store not found', 'NOT_FOUND'), 404);
+    }
+
+    const newActive = !store.isActive;
+    const [updated] = await db
+      .update(stores)
+      .set({ isActive: newActive })
+      .where(eq(stores.id, id))
+      .returning({ isActive: stores.isActive });
+
+    return c.json(successResponse({
+      id,
+      isActive: updated.isActive,
+      message: updated.isActive ? 'Store activated' : 'Store blocked',
+    }));
+  } catch (err) {
+    return c.json(errorResponse('Failed to update store', 'DATABASE_ERROR'), 500);
+  }
+});
+
+// =============================================
+// PUT /v1/admin/stores/:id/expiry
+// Set expiry date for a store
+// =============================================
+admin.put('/v1/admin/stores/:id/expiry', async (c) => {
+  try {
+    const id = parseInt(c.req.param('id'));
+    if (isNaN(id)) {
+      return c.json(errorResponse('Invalid store ID', 'VALIDATION_ERROR'), 400);
+    }
+
+    const body = await c.req.json();
+    const { expiresAt } = body;
+
+    // null means no expiry (lifetime)
+    const expiryDate = expiresAt ? new Date(expiresAt) : null;
+
+    if (expiryDate && isNaN(expiryDate.getTime())) {
+      return c.json(errorResponse('Invalid date format', 'VALIDATION_ERROR'), 400);
+    }
+
+    const [store] = await db.select({ id: stores.id }).from(stores).where(eq(stores.id, id));
+    if (!store) {
+      return c.json(errorResponse('Store not found', 'NOT_FOUND'), 404);
+    }
+
+    await db.update(stores).set({ expiresAt: expiryDate }).where(eq(stores.id, id));
+
+    return c.json(successResponse({
+      id,
+      expiresAt: expiryDate ? expiryDate.toISOString() : null,
+      message: expiryDate ? `Expiry set to ${expiryDate.toISOString()}` : 'Expiry removed (lifetime)',
+    }));
+  } catch (err) {
+    return c.json(errorResponse('Failed to set expiry', 'DATABASE_ERROR'), 500);
+  }
+});
+
+// =============================================
+// GET /v1/admin/stores/:id/qr-token
+// Generate a QR sync token for a store
+// =============================================
+admin.get('/v1/admin/stores/:id/qr-token', async (c) => {
+  try {
+    const id = parseInt(c.req.param('id'));
+    if (isNaN(id)) {
+      return c.json(errorResponse('Invalid store ID', 'VALIDATION_ERROR'), 400);
+    }
+
+    const [store] = await db.select({ id: stores.id, slug: stores.slug }).from(stores).where(eq(stores.id, id));
+    if (!store) {
+      return c.json(errorResponse('Store not found', 'NOT_FOUND'), 404);
+    }
+
+    const token = generateQrToken({
+      storeId: store.id,
+      slug: store.slug,
+      purpose: 'sync',
+    });
+
+    const customerUrl = `/#/s/${store.slug}?token=${token}`;
+
+    return c.json(successResponse({
+      token,
+      customerUrl,
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    }));
+  } catch (err) {
+    return c.json(errorResponse('Failed to generate QR token', 'DATABASE_ERROR'), 500);
+  }
+});
+
+export default admin;
+
+FILE: src/utils/xml-parser.ts
+
+================================================================================
+import { XMLParser } from 'fast-xml-parser';
+
+export interface ParsedProduct {
+  internalRef: string;
+  barcode: string | null;
+  name: string | null;
+  price: number;
+}
+
+export interface ParseResult {
+  products: ParsedProduct[];
+  errors: string[];
+  stats: {
+    total: number;
+    withBarcode: number;
+    withoutBarcode: number;
+  };
+}
+
+const BARCODE_REGEX = /^\d{8,13}$/;
+
+function decodeHtmlEntities(str: string): string {
+  return str.replace(/&#(\d+);/g, (_, code) => String.fromCharCode(parseInt(code, 10)));
+}
+
+function normalizePrice(str: string): number {
+  const cleaned = str.replace(/\s/g, '').replace(',', '.');
+  const value = parseFloat(cleaned);
+  return isNaN(value) ? NaN : value;
+}
+
+export function parseXml(xmlBuffer: Buffer): ParseResult {
+  const xmlString = xmlBuffer.toString('latin1');
+
+  const parser = new XMLParser({
+    ignoreAttributes: true,
+    isArray: (name) => name === 'TEXT',
+  });
+
+  const parsed = parser.parse(xmlString);
+
+  if (!parsed.DOCUMENT?.TEXT) {
+    throw new Error('Unsupported format. XML must have a <DOCUMENT> root with <TEXT> elements.');
+  }
+
+  const textNodes: string[] = parsed.DOCUMENT.TEXT.map((node: string | number | { '#text': string }) =>
+    typeof node === 'string' ? node
+      : typeof node === 'number' ? String(node)
+      : node?.['#text'] ?? ''
+  );
+
+  const decoded = textNodes.map((n) => decodeHtmlEntities(n?.trim() || ''));
+
+  const prixIndices: number[] = [];
+  for (let idx = 0; idx < decoded.length; idx++) {
+    if (decoded[idx].toLowerCase() === 'prix') {
+      prixIndices.push(idx);
+    }
+  }
+
+  if (prixIndices.length === 0) {
+    throw new Error('Unsupported format. Could not find "Prix" header in XML.');
+  }
+
+  const products: ParsedProduct[] = [];
+  const errors: string[] = [];
+  let withBarcode = 0;
+  let withoutBarcode = 0;
+
+  for (const prixIdx of prixIndices) {
+    const start = prixIdx + 1;
+
+    for (let i = start; i < decoded.length - 2; i += 3) {
+      const ref = decoded[i];
+      const middle = decoded[i + 1];
+      const priceRaw = decoded[i + 2];
+
+      const isPriceHeader = priceRaw.toLowerCase() === 'prix';
+      const isAnyHeader =
+        isPriceHeader ||
+        ref.toLowerCase() === 'référence' || ref.toLowerCase() === 'reference' ||
+        ref.toLowerCase() === 'désignation' || ref.toLowerCase() === 'designation' ||
+        middle.toLowerCase() === 'référence' || middle.toLowerCase() === 'reference' ||
+        middle.toLowerCase() === 'désignation' || middle.toLowerCase() === 'designation' ||
+        priceRaw.toLowerCase() === 'référence' || priceRaw.toLowerCase() === 'reference' ||
+        priceRaw.toLowerCase() === 'désignation' || priceRaw.toLowerCase() === 'designation';
+
+      if (isAnyHeader) {
+        break;
+      }
+
+      if (!ref || ref.length < 2) {
+        continue;
+      }
+
+      const price = normalizePrice(priceRaw);
+      if (isNaN(price) || price < 0) {
+        errors.push(`Row ${i}: Invalid price "${priceRaw}" for ref "${ref}"`);
+        continue;
+      }
+
+      const isBarcode = BARCODE_REGEX.test(middle);
+
+      if (isBarcode) {
+        products.push({ internalRef: ref, barcode: middle, name: null, price });
+        withBarcode++;
+      } else {
+        products.push({ internalRef: ref, barcode: null, name: middle || null, price });
+        withoutBarcode++;
+      }
+    }
+  }
+
+  return {
+    products,
+    errors,
+    stats: {
+      total: products.length,
+      withBarcode,
+      withoutBarcode,
+    },
+  };
+}
+
+FILE: src/utils/sync-engine.ts
+
+================================================================================
+import { eq, sql } from 'drizzle-orm';
+import { db } from '../db/index.js';
+import { products, stores } from '../db/schema.js';
+import type { ParsedProduct } from './xml-parser.js';
+
+export interface SyncReport {
+  imported: number;
+  updated: number;
+  new: number;
+  skipped: number;
+  errors: string[];
+}
+
+export async function syncProducts(storeId: number, parsedProducts: ParsedProduct[]): Promise<SyncReport> {
+  const barcodes = parsedProducts
+    .filter((p) => p.barcode !== null)
+    .map((p) => p.barcode!);
+
+  const productsWithoutBarcode = parsedProducts.filter((p) => p.barcode === null);
+
+  if (barcodes.length === 0) {
+    return {
+      imported: 0,
+      updated: 0,
+      new: 0,
+      skipped: productsWithoutBarcode.length,
+      errors: ['No products with valid barcodes found in XML'],
+    };
+  }
+
+  const existing = await db
+    .select({ barcode: products.barcode, price: products.price, oldPrice: products.oldPrice })
+    .from(products)
+    .where(eq(products.storeId, storeId));
+
+  const existingMap = new Map(
+    existing.map((p) => [p.barcode, { price: Number(p.price), oldPrice: p.oldPrice ? Number(p.oldPrice) : null }])
+  );
+
+  const existingBarcodes = new Set(existing.map((p) => p.barcode));
+  const newBarcodes = new Set(barcodes.filter((b) => !existingBarcodes.has(b)));
+
+  const upsertData = parsedProducts
+    .filter((p) => p.barcode !== null)
+    .map((p) => {
+      const existing = existingMap.get(p.barcode!);
+      const newPrice = p.price;
+      let old_price: number | null = null;
+
+      if (existing) {
+        if (newPrice < existing.price) {
+          old_price = existing.price;
+        } else if (newPrice > existing.price) {
+          old_price = null;
+        } else {
+          old_price = existing.oldPrice;
+        }
+      }
+
+      return {
+        storeId,
+        barcode: p.barcode!,
+        internalRef: p.internalRef,
+        name: p.name,
+        price: String(p.price),
+        oldPrice: old_price !== null ? String(old_price) : null,
+      };
+    });
+
+  const BATCH_SIZE = 500;
+  let updated = 0;
+  let newCount = 0;
+
+  for (let i = 0; i < upsertData.length; i += BATCH_SIZE) {
+    const batch = upsertData.slice(i, i + BATCH_SIZE);
+
+    const result = await db
+      .insert(products)
+      .values(batch)
+      .onConflictDoUpdate({
+        target: [products.storeId, products.barcode],
+        set: {
+          price: sql`excluded.price`,
+          internalRef: sql`excluded.internal_ref`,
+          name: sql`excluded.name`,
+          oldPrice: sql`excluded.old_price`,
+          updatedAt: sql`NOW()`,
+        },
+      })
+      .returning({ barcode: products.barcode });
+
+    for (const row of result) {
+      if (newBarcodes.has(row.barcode)) {
+        newCount++;
+      } else {
+        updated++;
+      }
+    }
+  }
+
+  await db.execute(sql`SELECT increment_version(${storeId})`);
+
+  return {
+    imported: barcodes.length,
+    updated,
+    new: newCount,
+    skipped: productsWithoutBarcode.length,
+    errors: [],
+  };
+}
+
+export async function clearProducts(storeId: number): Promise<void> {
+  await db.delete(products).where(eq(products.storeId, storeId));
+  await db.execute(sql`SELECT increment_version(${storeId})`);
+}
+
+FILE: src/utils/response.ts
+
+================================================================================
+export interface SuccessResponse<T = unknown> {
+  success: true;
+  data: T;
+  timestamp: string;
+}
+
+export interface ErrorResponse {
+  success: false;
+  error: string;
+  code: string;
+  timestamp: string;
+}
+
+type ErrorCode =
+  | 'UNAUTHORIZED'
+  | 'FORBIDDEN'
+  | 'NOT_FOUND'
+  | 'VALIDATION_ERROR'
+  | 'DUPLICATE'
+  | 'PARSE_ERROR'
+  | 'DATABASE_ERROR'
+  | 'RATE_LIMITED'
+  | 'ACCOUNT_SUSPENDED'
+  | 'ACCOUNT_EXPIRED'
+  | 'INVALID_TOKEN'
+  | 'OWNERSHIP_ERROR';
+
+export function successResponse<T>(data: T): SuccessResponse<T> {
+  return {
+    success: true,
+    data,
+    timestamp: new Date().toISOString(),
+  };
+}
+
+export function errorResponse(
+  error: string,
+  code: ErrorCode,
+  statusCode?: number
+): ErrorResponse {
+  return {
+    success: false,
+    error,
+    code,
+    timestamp: new Date().toISOString(),
+  };
+}
+
+FILE: Dockerfile
+
+================================================================================
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npx drizzle-kit generate
+RUN npm run build
+RUN npm prune --omit=dev
+
+FROM node:20-alpine
+WORKDIR /app
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/drizzle ./drizzle
+COPY --from=builder /app/package.json ./
+COPY --from=builder /app/sql ./sql
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
+USER appuser
+EXPOSE 3000
+ENTRYPOINT ["/docker-entrypoint.sh"]
+FILE: docker-entrypoint.sh
+
+================================================================================
+#!/bin/sh
+set -e
+
+echo "Running database migrations..."
+npx drizzle-kit push 2>&1
+
+echo "Starting server..."
+exec node dist/index.js
+FILE: ../frontend/public/index.html
+
+================================================================================
+<!DOCTYPE html>
+<html lang="ar" dir="ltr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#F8F6F1">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="description" content="Scan barcodes to check prices instantly">
+
+  <title>Price Check</title>
+
+  <link rel="manifest" href="/manifest.json">
+  <link rel="icon" type="image/svg+xml" href="/icons/favicon.svg">
+  <link rel="apple-touch-icon" href="/icons/icon-192.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+  <style>
+    /* =============================================
+       RESET
+       ============================================= */
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    /* =============================================
+       DESIGN TOKENS
+       ============================================= */
+    :root {
+      --bg: #F8F6F1;
+      --surface: #FFFFFF;
+      --surface-alt: #F0EDE6;
+      --border: #E4E0D8;
+
+      --text-primary: #2A2824;
+      --text-secondary: #6E6A60;
+      --text-muted: #9E9A90;
+
+      --accent: #1A7A5C;
+      --accent-hover: #156B4F;
+      --accent-light: #E8F5EF;
+
+      --promotion: #D94F3B;
+      --promotion-bg: #FDF0EE;
+
+      --danger: #C43D2E;
+      --danger-bg: #FCEAE8;
+
+      --radius-sm: 8px;
+      --radius-md: 12px;
+      --radius-lg: 16px;
+      --radius-xl: 24px;
+
+      --shadow-sm: 0 1px 3px rgba(42,40,36,0.06);
+      --shadow-md: 0 4px 12px rgba(42,40,36,0.08);
+      --shadow-lg: 0 8px 24px rgba(42,40,36,0.1);
+
+      --font: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+
+      --safe-bottom: env(safe-area-inset-bottom, 0px);
+      --nav-height: 64px;
+    }
+
+    html {
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text-primary);
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    body {
+      min-height: 100dvh;
+      overflow-x: hidden;
+      padding-bottom: calc(var(--nav-height) + var(--safe-bottom) + 16px);
+    }
+
+    /* =============================================
+       TYPOGRAPHY
+       ============================================= */
+    h1 { font-size: 1.5rem; font-weight: 700; letter-spacing: -0.02em; line-height: 1.2; }
+    h2 { font-size: 1.125rem; font-weight: 600; letter-spacing: -0.01em; line-height: 1.3; }
+    h3 { font-size: 0.9375rem; font-weight: 600; line-height: 1.35; }
+    .label { font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-muted); }
+
+    /* =============================================
+           TOP BAR
+       ============================================= */
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      background: rgba(248,246,241,0.85);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      padding: 12px 20px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .topbar-inner {
+      max-width: 480px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .store-name {
+      font-size: 1rem;
+      font-weight: 700;
+      color: var(--text-primary);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 60%;
+    }
+
+    .sync-status {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      font-weight: 500;
+    }
+
+    .sync-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--accent);
+      flex-shrink: 0;
+    }
+
+    .sync-dot.stale { background: var(--text-muted); }
+    .sync-dot.error { background: var(--danger); }
+
+    /* =============================================
+           VIEWS (SPA pages)
+       ============================================= */
+    .view {
+      display: none;
+      max-width: 480px;
+      margin: 0 auto;
+      padding: 20px;
+      animation: viewIn 0.2s ease-out;
+    }
+
+    .view.active { display: block; }
+
+    @keyframes viewIn {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* =============================================
+           SCANNER VIEW
+       ============================================= */
+    .scanner-container {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 4 / 3;
+      border-radius: var(--radius-lg);
+      overflow: hidden;
+      background: #1A1A1A;
+      margin-bottom: 20px;
+    }
+
+    .scanner-container video {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .scanner-overlay {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      pointer-events: none;
+    }
+
+    .scan-frame {
+      width: 65%;
+      height: 45%;
+      border: 2px solid rgba(255,255,255,0.6);
+      border-radius: var(--radius-md);
+      position: relative;
+    }
+
+    .scan-frame::before,
+    .scan-frame::after {
+      content: '';
+      position: absolute;
+      width: 24px;
+      height: 24px;
+      border-color: var(--accent);
+      border-style: solid;
+    }
+
+    .scan-frame::before {
+      top: -1px;
+      left: -1px;
+      border-width: 3px 0 0 3px;
+      border-radius: 6px 0 0 0;
+    }
+
+    .scan-frame::after {
+      bottom: -1px;
+      right: -1px;
+      border-width: 0 3px 3px 0;
+      border-radius: 0 0 6px 0;
+    }
+
+    .scan-line {
+      position: absolute;
+      left: 5%;
+      right: 5%;
+      height: 2px;
+      background: var(--accent);
+      border-radius: 1px;
+      animation: scanLine 2s ease-in-out infinite;
+      box-shadow: 0 0 8px rgba(26,122,92,0.4);
+    }
+
+    @keyframes scanLine {
+      0%, 100% { top: 15%; opacity: 0.4; }
+      50% { top: 80%; opacity: 1; }
+    }
+
+    .scanner-btn {
+      width: 100%;
+      padding: 14px;
+      background: var(--accent);
+      color: white;
+      border: none;
+      border-radius: var(--radius-md);
+      font-family: var(--font);
+      font-size: 0.9375rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+
+    .scanner-btn:active { background: var(--accent-hover); }
+
+    .manual-input-group {
+      display: flex;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .manual-input {
+      flex: 1;
+      padding: 12px 14px;
+      background: var(--surface);
+      border: 1.5px solid var(--border);
+      border-radius: var(--radius-md);
+      font-family: var(--font);
+      font-size: 0.9375rem;
+      color: var(--text-primary);
+      outline: none;
+      transition: border-color 0.15s;
+      direction: ltr;
+      text-align: left;
+    }
+
+    .manual-input:focus { border-color: var(--accent); }
+    .manual-input::placeholder { color: var(--text-muted); }
+
+    .manual-btn {
+      padding: 12px 18px;
+      background: var(--surface);
+      border: 1.5px solid var(--border);
+      border-radius: var(--radius-md);
+      font-family: var(--font);
+      font-size: 0.875rem;
+      font-weight: 600;
+      color: var(--text-primary);
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background 0.15s;
+    }
+
+    .manual-btn:active { background: var(--surface-alt); }
+
+    /* =============================================
+           RESULT CARD
+       ============================================= */
+    .result-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 20px;
+      margin-top: 16px;
+      display: none;
+      animation: cardIn 0.25s ease-out;
+    }
+
+    .result-card.show { display: block; }
+
+    @keyframes cardIn {
+      from { opacity: 0; transform: translateY(12px) scale(0.98); }
+      to { opacity: 1; transform: translateY(0) scale(1); }
+    }
+
+    .result-ref {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      font-weight: 500;
+      margin-bottom: 4px;
+    }
+
+    .result-name {
+      font-size: 1.0625rem;
+      font-weight: 600;
+      margin-bottom: 12px;
+      line-height: 1.3;
+    }
+
+    .result-price-row {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+
+    .result-price {
+      font-size: 1.75rem;
+      font-weight: 700;
+      color: var(--accent);
+      letter-spacing: -0.02em;
+    }
+
+    .result-old-price {
+      font-size: 1rem;
+      color: var(--text-muted);
+      text-decoration: line-through;
+    }
+
+    .result-promo-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 8px;
+      background: var(--promotion-bg);
+      color: var(--promotion);
+      border-radius: 6px;
+      font-size: 0.75rem;
+      font-weight: 600;
+    }
+
+    .result-unit {
+      font-size: 0.8125rem;
+      color: var(--text-secondary);
+      margin-bottom: 16px;
+    }
+
+    .add-to-cart-btn {
+      width: 100%;
+      padding: 12px;
+      background: var(--accent);
+      color: white;
+      border: none;
+      border-radius: var(--radius-md);
+      font-family: var(--font);
+      font-size: 0.9375rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+
+    .add-to-cart-btn:active { background: var(--accent-hover); }
+
+    .not-found {
+      text-align: center;
+      padding: 32px 20px;
+      display: none;
+    }
+
+    .not-found.show { display: block; }
+
+    .not-found-icon {
+      width: 48px;
+      height: 48px;
+      border-radius: 50%;
+      background: var(--surface-alt);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 0 auto 12px;
+      font-size: 1.25rem;
+    }
+
+    .not-found h3 {
+      color: var(--text-primary);
+      margin-bottom: 4px;
+    }
+
+    .not-found p {
+      font-size: 0.875rem;
+      color: var(--text-secondary);
+    }
+
+    /* =============================================
+           SEARCH VIEW
+       ============================================= */
+    .search-input-wrap {
+      position: relative;
+      margin-bottom: 16px;
+    }
+
+    .search-icon {
+      position: absolute;
+      left: 14px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--text-muted);
+      pointer-events: none;
+    }
+
+    .search-input {
+      width: 100%;
+      padding: 12px 14px 12px 40px;
+      background: var(--surface);
+      border: 1.5px solid var(--border);
+      border-radius: var(--radius-md);
+      font-family: var(--font);
+      font-size: 0.9375rem;
+      color: var(--text-primary);
+      outline: none;
+      transition: border-color 0.15s;
+    }
+
+    .search-input:focus { border-color: var(--accent); }
+    .search-input::placeholder { color: var(--text-muted); }
+
+    .search-results {
+      display: flex;
+      flex-direction: column;
+      gap: 1px;
+    }
+
+    .search-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 0;
+      border-bottom: 1px solid var(--border);
+      cursor: pointer;
+      transition: background 0.1s;
+    }
+
+    .search-item:active { background: var(--surface-alt); margin: 0 -20px; padding: 14px 20px; }
+
+    .search-item-info { flex: 1; min-width: 0; }
+
+    .search-item-name {
+      font-size: 0.9375rem;
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .search-item-ref {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      margin-top: 2px;
+    }
+
+    .search-item-price {
+      font-size: 1rem;
+      font-weight: 700;
+      color: var(--accent);
+      white-space: nowrap;
+      margin-left: 12px;
+    }
+
+    .search-item-old {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      text-decoration: line-through;
+      margin-left: 6px;
+    }
+
+    .search-count {
+      font-size: 0.8125rem;
+      color: var(--text-muted);
+      margin-bottom: 12px;
+      font-weight: 500;
+    }
+
+    /* =============================================
+           BASKET VIEW
+       ============================================= */
+    .basket-empty {
+      text-align: center;
+      padding: 60px 20px;
+    }
+
+    .basket-empty-icon {
+      font-size: 2.5rem;
+      margin-bottom: 12px;
+      opacity: 0.3;
+    }
+
+    .basket-empty h3 {
+      color: var(--text-primary);
+      margin-bottom: 4px;
+    }
+
+    .basket-empty p {
+      font-size: 0.875rem;
+      color: var(--text-secondary);
+    }
+
+    .basket-item {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 0;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .basket-item-info { flex: 1; min-width: 0; }
+
+    .basket-item-name {
+      font-size: 0.9375rem;
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .basket-item-price {
+      font-size: 0.8125rem;
+      color: var(--text-secondary);
+      margin-top: 2px;
+    }
+
+    .basket-item-controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+
+    .qty-btn {
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
+      border: 1.5px solid var(--border);
+      background: var(--surface);
+      font-size: 1rem;
+      font-weight: 600;
+      color: var(--text-primary);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.1s;
+    }
+
+    .qty-btn:active { background: var(--surface-alt); }
+
+    .qty-btn.remove {
+      border-color: var(--danger-bg);
+      color: var(--danger);
+    }
+
+    .basket-item-qty {
+      font-size: 0.9375rem;
+      font-weight: 600;
+      min-width: 20px;
+      text-align: center;
+    }
+
+    .basket-item-subtotal {
+      font-size: 0.9375rem;
+      font-weight: 700;
+      color: var(--text-primary);
+      white-space: nowrap;
+      min-width: 60px;
+      text-align: right;
+    }
+
+    .basket-footer {
+      position: fixed;
+      bottom: calc(var(--nav-height) + var(--safe-bottom));
+      left: 0;
+      right: 0;
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      padding: 14px 20px;
+      z-index: 90;
+      display: none;
+    }
+
+    .basket-footer.show { display: block; }
+
+    .basket-footer-inner {
+      max-width: 480px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .basket-total-label {
+      font-size: 0.8125rem;
+      color: var(--text-secondary);
+      font-weight: 500;
+    }
+
+    .basket-total-value {
+      font-size: 1.375rem;
+      font-weight: 700;
+      color: var(--accent);
+      letter-spacing: -0.01em;
+    }
+
+    .basket-clear-btn {
+      padding: 8px 14px;
+      background: none;
+      border: 1.5px solid var(--danger-bg);
+      border-radius: var(--radius-sm);
+      color: var(--danger);
+      font-family: var(--font);
+      font-size: 0.8125rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+
+    .basket-clear-btn:active { background: var(--danger-bg); }
+
+    /* =============================================
+           BOTTOM NAV
+       ============================================= */
+    .bottom-nav {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      height: calc(var(--nav-height) + var(--safe-bottom));
+      padding-bottom: var(--safe-bottom);
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      display: flex;
+      z-index: 200;
+    }
+
+    .nav-item {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 3px;
+      text-decoration: none;
+      color: var(--text-muted);
+      font-size: 0.6875rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: color 0.15s;
+      -webkit-tap-highlight-color: transparent;
+      position: relative;
+    }
+
+    .nav-item.active { color: var(--accent); }
+
+    .nav-item svg { width: 22px; height: 22px; }
+
+    .nav-badge {
+      position: absolute;
+      top: 6px;
+      right: 50%;
+      transform: translateX(14px);
+      min-width: 16px;
+      height: 16px;
+      padding: 0 4px;
+      background: var(--promotion);
+      color: white;
+      border-radius: 8px;
+      font-size: 0.625rem;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      line-height: 1;
+    }
+
+    .nav-badge:empty { display: none; }
+
+    /* =============================================
+           LOADING / TOAST
+       ============================================= */
+    .loading-bar {
+      position: fixed;
+      top: 0;
+      left: 0;
+      height: 2px;
+      background: var(--accent);
+      z-index: 999;
+      transition: width 0.3s ease-out, opacity 0.3s;
+      opacity: 0;
+    }
+
+    .loading-bar.active { opacity: 1; }
+
+    .toast {
+      position: fixed;
+      bottom: calc(var(--nav-height) + var(--safe-bottom) + 16px);
+      left: 50%;
+      transform: translateX(-50%) translateY(20px);
+      background: var(--text-primary);
+      color: white;
+      padding: 10px 18px;
+      border-radius: var(--radius-xl);
+      font-size: 0.8125rem;
+      font-weight: 500;
+      z-index: 300;
+      opacity: 0;
+      transition: transform 0.25s ease-out, opacity 0.25s;
+      pointer-events: none;
+      white-space: nowrap;
+    }
+
+    .toast.show {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
+    }
+
+    /* =============================================
+           ERROR / EMPTY STATES
+       ============================================= */
+    .error-screen {
+      display: none;
+      text-align: center;
+      padding: 60px 24px;
+      max-width: 480px;
+      margin: 0 auto;
+    }
+
+    .error-screen.show { display: block; }
+
+    .error-screen h2 {
+      margin-top: 16px;
+      margin-bottom: 8px;
+    }
+
+    .error-screen p {
+      font-size: 0.875rem;
+      color: var(--text-secondary);
+      line-height: 1.5;
+    }
+
+    .error-screen .retry-btn {
+      margin-top: 20px;
+      padding: 12px 24px;
+      background: var(--accent);
+      color: white;
+      border: none;
+      border-radius: var(--radius-md);
+      font-family: var(--font);
+      font-size: 0.9375rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    /* =============================================
+           INSTALL PROMPT
+       ============================================= */
+    .install-banner {
+      background: var(--accent-light);
+      border: 1px solid rgba(26,122,92,0.15);
+      border-radius: var(--radius-md);
+      padding: 14px 16px;
+      margin-bottom: 16px;
+      display: none;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .install-banner.show { display: flex; }
+
+    .install-banner-text {
+      flex: 1;
+      font-size: 0.8125rem;
+      font-weight: 500;
+      color: var(--text-primary);
+      line-height: 1.4;
+    }
+
+    .install-banner-btn {
+      padding: 6px 12px;
+      background: var(--accent);
+      color: white;
+      border: none;
+      border-radius: var(--radius-sm);
+      font-family: var(--font);
+      font-size: 0.75rem;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    .install-banner-close {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      padding: 4px;
+    }
+
+    /* =============================================
+           iOS TOOLTIP
+       ============================================= */
+    .ios-tooltip {
+      display: none;
+      position: fixed;
+      bottom: calc(var(--nav-height) + var(--safe-bottom) + 16px);
+      right: 16px;
+      background: var(--text-primary);
+      color: white;
+      padding: 12px 16px;
+      border-radius: var(--radius-md);
+      font-size: 0.8125rem;
+      line-height: 1.4;
+      max-width: 220px;
+      z-index: 250;
+      box-shadow: var(--shadow-lg);
+    }
+
+    .ios-tooltip::after {
+      content: '';
+      position: absolute;
+      bottom: -6px;
+      right: 24px;
+      width: 12px;
+      height: 12px;
+      background: var(--text-primary);
+      transform: rotate(45deg);
+    }
+
+    .ios-tooltip button {
+      display: block;
+      margin-top: 8px;
+      background: none;
+      border: none;
+      color: rgba(255,255,255,0.7);
+      font-family: var(--font);
+      font-size: 0.75rem;
+      font-weight: 600;
+      cursor: pointer;
+      padding: 0;
+    }
+
+    /* =============================================
+       OFFLINE BANNER
+       ============================================= */
+    .offline-banner {
+      display: none;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 10px 16px;
+      background: var(--text-primary);
+      color: white;
+      font-size: 0.8125rem;
+      font-weight: 500;
+      text-align: center;
+    }
+
+    .offline-banner.show { display: flex; }
+
+    /* =============================================
+       SEARCH CLEAR BUTTON
+       ============================================= */
+    .search-clear {
+      position: absolute;
+      right: 12px;
+      top: 50%;
+      transform: translateY(-50%);
+      background: var(--surface-alt);
+      border: none;
+      border-radius: 50%;
+      width: 22px;
+      height: 22px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      color: var(--text-muted);
+      transition: color 0.15s;
+    }
+
+    .search-clear:active { color: var(--text-primary); }
+  </style>
+</head>
+<body>
+
+  <!-- =============================================
+       OFFLINE BANNER
+       ============================================= -->
+  <div class="offline-banner" id="offlineBanner">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="1" y1="1" x2="23" y2="23"/><path d="M16.72 11.06A10.94 10.94 0 0 1 19 12.55"/><path d="M5 12.55a10.94 10.94 0 0 1 5.17-2.39"/><path d="M10.71 5.05A16 16 0 0 1 22.56 9"/><path d="M1.42 9a15.91 15.91 0 0 1 4.7-2.88"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></svg>
+    You are offline — using cached data
+  </div>
+
+  <!-- =============================================
+       LOADING BAR
+       ============================================= -->
+  <div class="loading-bar" id="loadingBar"></div>
+
+  <!-- =============================================
+       TOAST
+       ============================================= -->
+  <div class="toast" id="toast"></div>
+
+  <!-- =============================================
+       TOP BAR
+       ============================================= -->
+  <header class="topbar" id="topbar" style="display:none;">
+    <div class="topbar-inner">
+      <div class="store-name" id="storeName">Loading...</div>
+      <div class="sync-status" id="syncStatus">
+        <span class="sync-dot"></span>
+        <span id="syncText">Synced</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- =============================================
+       SCANNER VIEW
+       ============================================= -->
+  <div class="view" id="view-scan" data-view="scan">
+    <div id="installBanner" class="install-banner">
+      <div class="install-banner-text">Add to home screen for quick access</div>
+      <button class="install-banner-btn" id="installBtn">Install</button>
+      <button class="install-banner-close" id="installClose" aria-label="Dismiss">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+
+    <div class="scanner-container" id="scannerContainer" style="display:none;">
+      <div id="scanner"></div>
+      <div class="scanner-overlay">
+        <div class="scan-frame">
+          <div class="scan-line"></div>
+        </div>
+      </div>
+    </div>
+
+    <button class="scanner-btn" id="scanToggle">Start Scanner</button>
+
+    <div class="manual-input-group">
+      <input class="manual-input" id="manualBarcode" type="text" inputmode="numeric" placeholder="Type barcode number..." autocomplete="off">
+      <button class="manual-btn" id="manualLookup">Look up</button>
+    </div>
+
+    <div class="result-card" id="resultCard">
+      <div class="result-ref" id="resultRef"></div>
+      <div class="result-name" id="resultName"></div>
+      <div class="result-price-row">
+        <span class="result-price" id="resultPrice"></span>
+        <span class="result-old-price" id="resultOldPrice" style="display:none;"></span>
+        <span class="result-promo-badge" id="resultPromo" style="display:none;">
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L15.09 8.26L22 9.27L17 14.14L18.18 21.02L12 17.77L5.82 21.02L7 14.14L2 9.27L8.91 8.26L12 2Z"/></svg>
+          Promo
+        </span>
+      </div>
+      <div class="result-unit" id="resultUnit"></div>
+      <button class="add-to-cart-btn" id="addToCartBtn">Add to basket</button>
+    </div>
+
+    <div class="not-found" id="notFound">
+      <div class="not-found-icon">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
+      </div>
+      <h3>Product not found</h3>
+      <p>Try scanning another barcode or type it manually above</p>
+    </div>
+  </div>
+
+  <!-- =============================================
+       SEARCH VIEW
+       ============================================= -->
+  <div class="view" id="view-search" data-view="search">
+    <div class="search-input-wrap">
+      <span class="search-icon">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+      </span>
+      <input class="search-input" id="searchInput" type="text" placeholder="Search products..." autocomplete="off">
+      <button class="search-clear" id="searchClear" aria-label="Clear search" style="display:none;">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div class="search-count" id="searchCount"></div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+
+  <!-- =============================================
+       BASKET VIEW
+       ============================================= -->
+  <div class="view" id="view-basket" data-view="basket">
+    <div id="basketContent"></div>
+  </div>
+
+  <div class="basket-footer" id="basketFooter">
+    <div class="basket-footer-inner">
+      <div>
+        <div class="basket-total-label">Total</div>
+        <div class="basket-total-value" id="basketTotal">0 DA</div>
+      </div>
+      <button class="basket-clear-btn" id="basketClearBtn">Clear</button>
+    </div>
+  </div>
+
+  <!-- =============================================
+       iOS INSTALL TOOLTIP
+       ============================================= -->
+  <div class="ios-tooltip" id="iosTooltip">
+    Tap <strong>Share</strong> then <strong>"Add to Home Screen"</strong> to install
+    <button id="iosTooltipClose">Got it</button>
+  </div>
+
+  <!-- =============================================
+       ERROR SCREEN
+       ============================================= -->
+  <div class="error-screen" id="errorScreen">
+    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+    <h2 id="errorTitle">Something went wrong</h2>
+    <p id="errorMessage">Please check your connection and try again.</p>
+    <button class="retry-btn" id="retryBtn">Try Again</button>
+  </div>
+
+  <!-- =============================================
+       BOTTOM NAV
+       ============================================= -->
+  <nav class="bottom-nav" id="bottomNav" style="display:none;">
+    <a class="nav-item active" data-nav="scan" id="navScan">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 7V5a2 2 0 0 1 2-2h2"/>
+        <path d="M17 3h2a2 2 0 0 1 2 2v2"/>
+        <path d="M21 17v2a2 2 0 0 1-2 2h-2"/>
+        <path d="M7 21H5a2 2 0 0 1-2-2v-2"/>
+        <line x1="7" y1="12" x2="17" y2="12"/>
+      </svg>
+      Scan
+    </a>
+    <a class="nav-item" data-nav="search" id="navSearch">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="11" cy="11" r="8"/>
+        <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+      </svg>
+      Search
+    </a>
+    <a class="nav-item" data-nav="basket" id="navBasket">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M6 2L3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/>
+        <line x1="3" y1="6" x2="21" y2="6"/>
+        <path d="M16 10a4 4 0 0 1-8 0"/>
+      </svg>
+      Basket
+      <span class="nav-badge" id="basketBadge"></span>
+    </a>
+  </nav>
+
+  <!-- =============================================
+       SCRIPTS
+       ============================================= -->
+  <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+  <script src="/js/db.js"></script>
+  <script src="/js/api.js"></script>
+  <script src="/js/app.js"></script>
+</body>
+</html>
+
+FILE: ../frontend/public/manifest.json
+
+================================================================================
+{
+  "name": "Mini-Market Price Checker",
+  "short_name": "Price Check",
+  "description": "Scan barcodes to check prices instantly",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#F8F6F1",
+  "theme_color": "#F8F6F1",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["shopping", "utilities"],
+  "lang": "ar"
+}
+
+FILE: ../frontend/public/sw.js
+
+================================================================================
+const CACHE_NAME = 'pricecheck-v1';
+const STATIC_ASSETS = [
+  '/',
+  '/index.html',
+  '/manifest.json',
+  '/icons/favicon.svg',
+  '/js/app.js',
+  '/js/api.js',
+  '/js/db.js',
+];
+
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    caches.open(CACHE_NAME).then((cache) => cache.addAll(STATIC_ASSETS))
+  );
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches.keys().then((keys) =>
+      Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k)))
+    )
+  );
+  self.clients.claim();
+});
+
+self.addEventListener('fetch', (event) => {
+  const { request } = event;
+  const url = new URL(request.url);
+
+  if (url.pathname.startsWith('/api/')) {
+    event.respondWith(
+      fetch(request).catch(() => {
+        return new Response(
+          JSON.stringify({ success: false, error: 'Offline', code: 'OFFLINE' }),
+          { status: 503, headers: { 'Content-Type': 'application/json' } }
+        );
+      })
+    );
+    return;
+  }
+
+  if (request.destination === 'script' || request.destination === 'style' || request.destination === 'document') {
+    event.respondWith(
+      caches.match(request).then((cached) => {
+        const fetched = fetch(request).then((response) => {
+          if (response.ok) {
+            const clone = response.clone();
+            caches.open(CACHE_NAME).then((cache) => cache.put(request, clone));
+          }
+          return response;
+        }).catch(() => cached);
+
+        return cached || fetched;
+      })
+    );
+    return;
+  }
+
+  event.respondWith(
+    caches.match(request).then((cached) => cached || fetch(request))
+  );
+});
+
+FILE: ../frontend/public/js/api.js
+
+================================================================================
+const API_BASE = (() => {
+  if (typeof window !== 'undefined') {
+    const loc = window.location;
+    if (loc.hostname === 'localhost' || loc.hostname === '127.0.0.1') {
+      return `http://${loc.hostname}:3000`;
+    }
+  }
+  return '';
+})();
+
+async function apiRequest(method, path, options = {}) {
+  const { body, retries = 2, timeout = 8000 } = options;
+  let lastError;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeout);
+
+      const fetchOptions = {
+        method,
+        signal: controller.signal,
+        headers: {},
+      };
+
+      if (body) {
+        if (body instanceof FormData) {
+          fetchOptions.body = body;
+        } else {
+          fetchOptions.headers['Content-Type'] = 'application/json';
+          fetchOptions.body = JSON.stringify(body);
+        }
+      }
+
+      const response = await fetch(`${API_BASE}${path}`, fetchOptions);
+      clearTimeout(timer);
+
+      const data = await response.json();
+
+      if (!response.ok || data.success === false) {
+        throw {
+          status: response.status,
+          code: data.code || 'UNKNOWN',
+          message: data.error || 'Request failed',
+        };
+      }
+
+      return data.data;
+    } catch (err) {
+      lastError = err;
+
+      if (err.name === 'AbortError') {
+        lastError = { status: 0, code: 'TIMEOUT', message: 'Request timed out' };
+      }
+
+      if (attempt < retries) {
+        const delay = Math.min(1000 * 2 ** attempt, 4000);
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+  }
+
+  throw lastError;
+}
+
+const API = {
+  getStore(slug) {
+    return apiRequest('GET', `/api/v1/stores/${slug}`);
+  },
+
+  getProducts(slug, token) {
+    return apiRequest('GET', `/api/v1/products/${slug}?token=${encodeURIComponent(token)}`);
+  },
+
+  getProduct(slug, barcode) {
+    return apiRequest('GET', `/api/v1/products/${slug}/${barcode}`);
+  },
+
+  login(email, password) {
+    return apiRequest('POST', '/api/v1/auth/login', {
+      body: { email, password },
+    });
+  },
+
+  signup(storeName, email, password, phone) {
+    return apiRequest('POST', '/api/v1/auth/signup', {
+      body: { storeName, email, password, phone },
+    });
+  },
+
+  uploadSync(token, file) {
+    const formData = new FormData();
+    formData.append('file', file);
+    return apiRequest('POST', '/api/v1/sync/upload', {
+      body: formData,
+      timeout: 30000,
+      retries: 0,
+    });
+  },
+
+  clearSync(token) {
+    return apiRequest('POST', '/api/v1/sync/clear');
+  },
+
+  getStats(token) {
+    return apiRequest('GET', '/api/v1/dashboard/stats');
+  },
+};
+
+window.API = API;
+
+FILE: ../frontend/public/js/db.js
+
+================================================================================
+const DB_NAME = 'pricecheck';
+const DB_VERSION = 1;
+const PRODUCTS_STORE = 'products';
+const META_STORE = 'meta';
+
+let dbInstance = null;
+
+function openDB() {
+  if (dbInstance) return Promise.resolve(dbInstance);
+
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+    request.onupgradeneeded = (event) => {
+      const db = event.target.result;
+
+      if (!db.objectStoreNames.contains(PRODUCTS_STORE)) {
+        const store = db.createObjectStore(PRODUCTS_STORE, { keyPath: 'barcode' });
+        store.createIndex('by_store', 'storeId', { unique: false });
+        store.createIndex('by_name', 'name', { unique: false });
+      }
+
+      if (!db.objectStoreNames.contains(META_STORE)) {
+        db.createObjectStore(META_STORE, { keyPath: 'key' });
+      }
+    };
+
+    request.onsuccess = (event) => {
+      dbInstance = event.target.result;
+      resolve(dbInstance);
+    };
+
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function getMeta(key) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(META_STORE, 'readonly');
+    const store = tx.objectStore(META_STORE);
+    const req = store.get(key);
+    req.onsuccess = () => resolve(req.result?.value ?? null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function setMeta(key, value) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(META_STORE, 'readwrite');
+    const store = tx.objectStore(META_STORE);
+    const req = store.put({ key, value });
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function getLocalVersion(storeSlug) {
+  return getMeta(`version_${storeSlug}`);
+}
+
+async function setLocalVersion(storeSlug, version) {
+  return setMeta(`version_${storeSlug}`, version);
+}
+
+async function setProducts(storeId, products) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(PRODUCTS_STORE, 'readwrite');
+    const store = tx.objectStore(PRODUCTS_STORE);
+
+    const storeIndex = store.index('by_store');
+    const range = IDBKeyRange.only(storeId);
+    const cursor = storeIndex.openCursor(range);
+
+    cursor.onsuccess = (event) => {
+      const c = event.target.result;
+      if (c) {
+        c.delete();
+        c.continue();
+      }
+    };
+
+    tx.oncomplete = () => {
+      const tx2 = db.transaction(PRODUCTS_STORE, 'readwrite');
+      const store2 = tx2.objectStore(PRODUCTS_STORE);
+
+      for (const p of products) {
+        store2.put({
+          storeId,
+          barcode: p.barcode,
+          internalRef: p.internalRef || null,
+          name: p.name || null,
+          price: parseFloat(p.price) || 0,
+          oldPrice: p.oldPrice ? parseFloat(p.oldPrice) : null,
+          unit: p.unit || null,
+        });
+      }
+
+      tx2.oncomplete = () => resolve();
+      tx2.onerror = () => reject(tx2.error);
+    };
+
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function getProduct(barcode) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(PRODUCTS_STORE, 'readonly');
+    const store = tx.objectStore(PRODUCTS_STORE);
+    const req = store.get(barcode);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function searchProducts(query) {
+  const db = await openDB();
+  const q = query.toLowerCase();
+
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(PRODUCTS_STORE, 'readonly');
+    const store = tx.objectStore(PRODUCTS_STORE);
+    const results = [];
+
+    const cursor = store.openCursor();
+    cursor.onsuccess = (event) => {
+      const c = event.target.result;
+      if (c) {
+        const p = c.value;
+        const match =
+          (p.name && p.name.toLowerCase().includes(q)) ||
+          (p.barcode && p.barcode.includes(q)) ||
+          (p.internalRef && p.internalRef.toLowerCase().includes(q));
+        if (match) results.push(p);
+        c.continue();
+      } else {
+        resolve(results);
+      }
+    };
+    cursor.onerror = () => reject(cursor.error);
+  });
+}
+
+async function getAllProducts() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(PRODUCTS_STORE, 'readonly');
+    const store = tx.objectStore(PRODUCTS_STORE);
+    const req = store.getAll();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function clearProducts() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(PRODUCTS_STORE, 'readwrite');
+    const store = tx.objectStore(PRODUCTS_STORE);
+    const req = store.clear();
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function getProductCount() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(PRODUCTS_STORE, 'readonly');
+    const store = tx.objectStore(PRODUCTS_STORE);
+    const req = store.count();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+window.IDB = {
+  openDB,
+  getMeta,
+  setMeta,
+  getLocalVersion,
+  setLocalVersion,
+  setProducts,
+  getProduct,
+  searchProducts,
+  getAllProducts,
+  clearProducts,
+  getProductCount,
+};
+
+FILE: ../frontend/public/js/app.js
+
+================================================================================
+(() => {
+  'use strict';
+
+  const App = {
+    slug: null,
+    token: null,
+    storeInfo: null,
+    scannerRunning: false,
+    html5QrCode: null,
+    lastScannedProduct: null,
+
+    init() {
+      this.parseRoute();
+      this.cacheDOM();
+      this.bindEvents();
+      this.registerSW();
+      this.checkInstallPrompt();
+      this.checkIOS();
+      this.setupConnectionStatus();
+      this.bootstrap();
+    },
+
+    parseRoute() {
+      const hash = window.location.hash.slice(1) || '/';
+      const match = hash.match(/^\/s\/([^/?]+)(?:\?.*)?$/);
+      if (match) {
+        this.slug = match[1];
+        const params = new URLSearchParams(hash.split('?')[1] || '');
+        this.token = params.get('token');
+      }
+    },
+
+    cacheDOM() {
+      this.els = {
+        topbar: document.getElementById('topbar'),
+        storeName: document.getElementById('storeName'),
+        syncStatus: document.getElementById('syncStatus'),
+        syncText: document.getElementById('syncText'),
+        bottomNav: document.getElementById('bottomNav'),
+        loadingBar: document.getElementById('loadingBar'),
+        toast: document.getElementById('toast'),
+        errorScreen: document.getElementById('errorScreen'),
+        errorTitle: document.getElementById('errorTitle'),
+        errorMessage: document.getElementById('errorMessage'),
+        retryBtn: document.getElementById('retryBtn'),
+        installBanner: document.getElementById('installBanner'),
+        installBtn: document.getElementById('installBtn'),
+        installClose: document.getElementById('installClose'),
+        iosTooltip: document.getElementById('iosTooltip'),
+        iosTooltipClose: document.getElementById('iosTooltipClose'),
+        scanToggle: document.getElementById('scanToggle'),
+        manualBarcode: document.getElementById('manualBarcode'),
+        manualLookup: document.getElementById('manualLookup'),
+        resultCard: document.getElementById('resultCard'),
+        resultRef: document.getElementById('resultRef'),
+        resultName: document.getElementById('resultName'),
+        resultPrice: document.getElementById('resultPrice'),
+        resultOldPrice: document.getElementById('resultOldPrice'),
+        resultPromo: document.getElementById('resultPromo'),
+        resultUnit: document.getElementById('resultUnit'),
+        addToCartBtn: document.getElementById('addToCartBtn'),
+        notFound: document.getElementById('notFound'),
+        searchInput: document.getElementById('searchInput'),
+        searchClear: document.getElementById('searchClear'),
+        searchCount: document.getElementById('searchCount'),
+        searchResults: document.getElementById('searchResults'),
+        basketContent: document.getElementById('basketContent'),
+        basketFooter: document.getElementById('basketFooter'),
+        basketTotal: document.getElementById('basketTotal'),
+        basketClearBtn: document.getElementById('basketClearBtn'),
+        basketBadge: document.getElementById('basketBadge'),
+        scannerContainer: document.getElementById('scannerContainer'),
+      };
+    },
+
+    bindEvents() {
+      document.querySelectorAll('[data-nav]').forEach((el) => {
+        el.addEventListener('click', (e) => {
+          e.preventDefault();
+          this.navigate(el.dataset.nav);
+        });
+      });
+
+      this.els.scanToggle.addEventListener('click', () => this.toggleScanner());
+      this.els.manualLookup.addEventListener('click', () => this.manualSearch());
+      this.els.manualBarcode.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') this.manualSearch();
+      });
+
+      this.els.addToCartBtn.addEventListener('click', () => this.addToCart());
+
+      this.els.searchInput.addEventListener('input', () => this.onSearch());
+      this.els.searchClear.addEventListener('click', () => {
+        this.els.searchInput.value = '';
+        this.els.searchClear.style.display = 'none';
+        this.els.searchCount.textContent = '';
+        this.els.searchResults.innerHTML = '';
+        this.els.searchInput.focus();
+      });
+
+      this.els.basketClearBtn.addEventListener('click', () => this.clearBasket());
+
+      this.els.retryBtn.addEventListener('click', () => this.bootstrap());
+      this.els.installBtn?.addEventListener('click', () => this.installApp());
+      this.els.installClose?.addEventListener('click', () => this.dismissInstall());
+      this.els.iosTooltipClose?.addEventListener('click', () => this.dismissIOSTooltip());
+
+      window.addEventListener('hashchange', () => {
+        this.parseRoute();
+        if (this.slug) this.bootstrap();
+      });
+    },
+
+    navigate(view) {
+      document.querySelectorAll('.view').forEach((v) => v.classList.remove('active'));
+      document.querySelectorAll('[data-nav]').forEach((n) => n.classList.remove('active'));
+
+      const viewEl = document.getElementById(`view-${view}`);
+      const navEl = document.querySelector(`[data-nav="${view}"]`);
+
+      if (viewEl) viewEl.classList.add('active');
+      if (navEl) navEl.classList.add('active');
+
+      if (view === 'basket') this.renderBasket();
+      if (view === 'search') this.els.searchInput.focus();
+      if (view === 'scan' && this.scannerRunning) this.startScanner();
+      if (view !== 'scan' && this.scannerRunning) this.stopScanner();
+
+      this.els.basketFooter.classList.toggle('show', view === 'basket' && this.getBasket().length > 0);
+      this.updateBadge();
+    },
+
+    showView(view) {
+      document.querySelectorAll('.view').forEach((v) => v.classList.remove('active'));
+      document.querySelectorAll('[data-nav]').forEach((n) => n.classList.remove('active'));
+
+      const viewEl = document.getElementById(`view-${view}`);
+      const navEl = document.querySelector(`[data-nav="${view}"]`);
+
+      if (viewEl) viewEl.classList.add('active');
+      if (navEl) navEl.classList.add('active');
+    },
+
+    registerSW() {
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.register('/sw.js').catch(() => {});
+      }
+    },
+
+    showLoading(show) {
+      this.els.loadingBar.classList.toggle('active', show);
+      if (show) {
+        this.els.loadingBar.style.width = '60%';
+        setTimeout(() => {
+          if (this.els.loadingBar.classList.contains('active')) {
+            this.els.loadingBar.style.width = '85%';
+          }
+        }, 600);
+      } else {
+        this.els.loadingBar.style.width = '100%';
+        setTimeout(() => {
+          this.els.loadingBar.classList.remove('active');
+          this.els.loadingBar.style.width = '0%';
+        }, 200);
+      }
+    },
+
+    showToast(message, duration = 2500) {
+      this.els.toast.textContent = message;
+      this.els.toast.classList.add('show');
+      clearTimeout(this._toastTimer);
+      this._toastTimer = setTimeout(() => this.els.toast.classList.remove('show'), duration);
+    },
+
+    showError(title, message) {
+      this.els.errorTitle.textContent = title;
+      this.els.errorMessage.textContent = message;
+      this.els.errorScreen.classList.add('show');
+    },
+
+    hideError() {
+      this.els.errorScreen.classList.remove('show');
+    },
+
+    async bootstrap() {
+      if (!this.slug) {
+        this.showError(
+          'No store specified',
+          'Scan a QR code at your local store to get started.'
+        );
+        return;
+      }
+
+      this.hideError();
+      this.showView('scan');
+      this.els.topbar.style.display = '';
+      this.els.bottomNav.style.display = '';
+      this.els.storeName.textContent = this.slug;
+
+      try {
+        this.showLoading(true);
+        this.storeInfo = await API.getStore(this.slug);
+        this.els.storeName.textContent = this.storeInfo.name || this.slug;
+
+        await this.syncCache();
+        this.navigate('scan');
+        this.updateSyncStatus('synced');
+      } catch (err) {
+        this.showLoading(false);
+
+        if (err.code === 'NOT_FOUND') {
+          this.showError('Store not found', `No store found for "${this.slug}". Check the QR code and try again.`);
+        } else if (err.code === 'ACCOUNT_SUSPENDED') {
+          this.showError('Store suspended', 'This store is currently unavailable. Contact the store owner.');
+        } else if (err.code === 'ACCOUNT_EXPIRED') {
+          this.showError('Store expired', 'This store subscription has expired. Contact the store owner.');
+        } else {
+          this.showError('Connection error', 'Could not reach the server. The app will use cached data if available.');
+
+          const count = await IDB.getProductCount();
+          if (count > 0) {
+            this.els.storeName.textContent = this.slug;
+            this.navigate('scan');
+          }
+        }
+      }
+    },
+
+    async syncCache() {
+      if (!this.storeInfo || !this.token) return;
+
+      const localVersion = await IDB.getLocalVersion(this.slug);
+
+      if (String(localVersion) === String(this.storeInfo.version)) {
+        return;
+      }
+
+      this.updateSyncStatus('syncing');
+
+      try {
+        const products = await API.getProducts(this.slug, this.token);
+        await IDB.setProducts(this.storeInfo.id, products);
+        await IDB.setLocalVersion(this.slug, this.storeInfo.version);
+        this.updateSyncStatus('synced');
+        this.showToast(`${products.length} products synced`);
+      } catch (err) {
+        this.updateSyncStatus('error');
+        const count = await IDB.getProductCount();
+        if (count === 0) {
+          throw err;
+        }
+      }
+    },
+
+    updateSyncStatus(status) {
+      const dot = this.els.syncStatus.querySelector('.sync-dot');
+      dot.className = 'sync-dot';
+      if (status === 'synced') {
+        this.els.syncText.textContent = 'Synced';
+      } else if (status === 'syncing') {
+        this.els.syncText.textContent = 'Syncing...';
+      } else if (status === 'error') {
+        dot.classList.add('error');
+        this.els.syncText.textContent = 'Offline';
+      } else if (status === 'stale') {
+        dot.classList.add('stale');
+        this.els.syncText.textContent = 'Stale';
+      }
+    },
+
+    toggleScanner() {
+      if (this.scannerRunning) {
+        this.stopScanner();
+      } else {
+        this.startScanner();
+      }
+    },
+
+    async startScanner() {
+      if (!window.Html5Qrcode) {
+        this.showToast('Scanner library not loaded. Use manual entry.');
+        return;
+      }
+
+      if (!this.html5QrCode) {
+        this.html5QrCode = new Html5Qrcode('scanner');
+      }
+
+      try {
+        this.els.scannerContainer.style.display = '';
+        this.els.scanToggle.textContent = 'Starting...';
+
+        await this.html5QrCode.start(
+          { facingMode: 'environment' },
+          { fps: 10, qrbox: { width: 250, height: 150 }, aspectRatio: 1.333 },
+          (decodedText) => this.onScanResult(decodedText),
+          () => {}
+        );
+        this.scannerRunning = true;
+        this.els.scanToggle.textContent = 'Stop Scanner';
+      } catch (err) {
+        this.scannerRunning = false;
+        this.els.scannerContainer.style.display = 'none';
+        this.els.scanToggle.textContent = 'Start Scanner';
+
+        if (err.toString().includes('NotAllowedError') || err.toString().includes('Permission')) {
+          this.showToast('Camera permission denied. Use manual entry.');
+        } else if (err.toString().includes('NotFound')) {
+          this.showToast('No camera found. Use manual entry.');
+        } else {
+          this.showToast('Scanner error. Use manual entry.');
+        }
+      }
+    },
+
+    async stopScanner() {
+      if (this.html5QrCode && this.scannerRunning) {
+        try {
+          await this.html5QrCode.stop();
+        } catch {}
+      }
+      this.scannerRunning = false;
+      this.els.scannerContainer.style.display = 'none';
+      this.els.scanToggle.textContent = 'Start Scanner';
+    },
+
+    async onScanResult(barcode) {
+      if (navigator.vibrate) navigator.vibrate(100);
+      this.stopScanner();
+      await this.lookupProduct(barcode.trim());
+    },
+
+    manualSearch() {
+      const val = this.els.manualBarcode.value.trim();
+      if (!val) return;
+      this.lookupProduct(val);
+    },
+
+    async lookupProduct(barcode) {
+      this.els.resultCard.classList.remove('show');
+      this.els.notFound.classList.remove('show');
+
+      try {
+        let product = await IDB.getProduct(barcode);
+
+        if (!product && navigator.onLine) {
+          try {
+            const apiProduct = await API.getProduct(this.slug, barcode);
+            if (apiProduct) {
+              product = {
+                storeId: this.storeInfo?.id,
+                barcode: apiProduct.barcode,
+                internalRef: apiProduct.internalRef,
+                name: apiProduct.name,
+                price: parseFloat(apiProduct.price) || 0,
+                oldPrice: apiProduct.oldPrice ? parseFloat(apiProduct.oldPrice) : null,
+                unit: apiProduct.unit,
+              };
+            }
+          } catch {}
+        }
+
+        if (!product) {
+          this.els.notFound.classList.add('show');
+          return;
+        }
+
+        this.lastScannedProduct = product;
+
+        this.els.resultRef.textContent = product.internalRef || product.barcode;
+        this.els.resultName.textContent = product.name || `Product ${product.barcode}`;
+        this.els.resultPrice.textContent = `${this.formatPrice(product.price)} DA`;
+
+        if (product.oldPrice && product.oldPrice > product.price) {
+          this.els.resultOldPrice.textContent = `${this.formatPrice(product.oldPrice)} DA`;
+          this.els.resultOldPrice.style.display = '';
+          this.els.resultPromo.style.display = '';
+          const pct = Math.round(((product.oldPrice - product.price) / product.oldPrice) * 100);
+          this.els.resultPromo.textContent = `-${pct}%`;
+          const badgeIcon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+          badgeIcon.setAttribute('width', '10');
+          badgeIcon.setAttribute('height', '10');
+          badgeIcon.setAttribute('viewBox', '0 0 24 24');
+          badgeIcon.setAttribute('fill', 'currentColor');
+          badgeIcon.innerHTML = '<path d="M12 2L15.09 8.26L22 9.27L17 14.14L18.18 21.02L12 17.77L5.82 21.02L7 14.14L2 9.27L8.91 8.26L12 2Z"/>';
+          this.els.resultPromo.textContent = '';
+          this.els.resultPromo.appendChild(badgeIcon);
+          this.els.resultPromo.appendChild(document.createTextNode(` -${pct}%`));
+        } else {
+          this.els.resultOldPrice.style.display = 'none';
+          this.els.resultPromo.style.display = 'none';
+        }
+
+        this.els.resultUnit.textContent = product.unit ? `Per ${product.unit}` : '';
+        this.els.resultCard.classList.add('show');
+      } catch (err) {
+        this.showToast('Lookup failed. Check connection.');
+      }
+    },
+
+    addToCart() {
+      if (!this.lastScannedProduct) return;
+
+      const basket = this.getBasket();
+      const existing = basket.find((i) => i.barcode === this.lastScannedProduct.barcode);
+
+      if (existing) {
+        existing.quantity += 1;
+      } else {
+        basket.push({ barcode: this.lastScannedProduct.barcode, quantity: 1 });
+      }
+
+      this.saveBasket(basket);
+      this.updateBadge();
+      this.showToast('Added to basket');
+    },
+
+    getBasketKey() {
+      return `basket_${this.slug || '_default'}`;
+    },
+
+    getBasket() {
+      try {
+        return JSON.parse(localStorage.getItem(this.getBasketKey()) || '[]');
+      } catch {
+        return [];
+      }
+    },
+
+    saveBasket(basket) {
+      localStorage.setItem(this.getBasketKey(), JSON.stringify(basket));
+    },
+
+    clearBasket() {
+      localStorage.removeItem(this.getBasketKey());
+      this.renderBasket();
+      this.updateBadge();
+      this.showToast('Basket cleared');
+    },
+
+    updateBadge() {
+      const basket = this.getBasket();
+      const count = basket.reduce((sum, i) => sum + i.quantity, 0);
+      this.els.basketBadge.textContent = count > 0 ? String(count) : '';
+    },
+
+    async renderBasket() {
+      const basket = this.getBasket();
+
+      if (basket.length === 0) {
+        this.els.basketContent.innerHTML = `
+          <div class="basket-empty">
+            <div class="basket-empty-icon">
+              <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M6 2L3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/>
+                <line x1="3" y1="6" x2="21" y2="6"/>
+                <path d="M16 10a4 4 0 0 1-8 0"/>
+              </svg>
+            </div>
+            <h3>Empty basket</h3>
+            <p>Scan a barcode to add products</p>
+          </div>
+        `;
+        this.els.basketFooter.classList.remove('show');
+        return;
+      }
+
+      let html = '';
+      let total = 0;
+
+      for (const item of basket) {
+        const product = await IDB.getProduct(item.barcode);
+        if (!product) continue;
+
+        const subtotal = product.price * item.quantity;
+        total += subtotal;
+
+        html += `
+          <div class="basket-item" data-barcode="${product.barcode}">
+            <div class="basket-item-info">
+              <div class="basket-item-name">${this.escapeHtml(product.name || product.barcode)}</div>
+              <div class="basket-item-price">${this.formatPrice(product.price)} DA each</div>
+            </div>
+            <div class="basket-item-controls">
+              <button class="qty-btn ${item.quantity <= 1 ? 'remove' : ''}" data-action="dec" data-barcode="${product.barcode}">
+                ${item.quantity <= 1 ? '&times;' : '−'}
+              </button>
+              <span class="basket-item-qty">${item.quantity}</span>
+              <button class="qty-btn" data-action="inc" data-barcode="${product.barcode}">+</button>
+            </div>
+            <div class="basket-item-subtotal">${this.formatPrice(subtotal)} DA</div>
+          </div>
+        `;
+      }
+
+      this.els.basketContent.innerHTML = html;
+      this.els.basketTotal.textContent = `${this.formatPrice(total)} DA`;
+      this.els.basketFooter.classList.add('show');
+
+      this.els.basketContent.querySelectorAll('[data-action]').forEach((btn) => {
+        btn.addEventListener('click', (e) => {
+          const bc = btn.dataset.barcode;
+          const action = btn.dataset.action;
+          this.updateQty(bc, action);
+        });
+      });
+    },
+
+    updateQty(barcode, action) {
+      const basket = this.getBasket();
+      const idx = basket.findIndex((i) => i.barcode === barcode);
+      if (idx === -1) return;
+
+      if (action === 'inc') {
+        basket[idx].quantity += 1;
+      } else if (action === 'dec') {
+        basket[idx].quantity -= 1;
+        if (basket[idx].quantity <= 0) basket.splice(idx, 1);
+      }
+
+      this.saveBasket(basket);
+      this.renderBasket();
+      this.updateBadge();
+    },
+
+    onSearch() {
+      clearTimeout(this._searchTimer);
+      const val = this.els.searchInput.value.trim();
+      this.els.searchClear.style.display = val.length > 0 ? 'flex' : 'none';
+      this._searchTimer = setTimeout(() => this.performSearch(), 200);
+    },
+
+    async performSearch() {
+      const query = this.els.searchInput.value.trim();
+      if (!query) {
+        this.els.searchCount.textContent = '';
+        this.els.searchResults.innerHTML = '';
+        return;
+      }
+
+      const results = await IDB.searchProducts(query);
+      this.els.searchCount.textContent = `${results.length} result${results.length !== 1 ? 's' : ''}`;
+
+      const maxShow = 50;
+      const shown = results.slice(0, maxShow);
+
+      this.els.searchResults.innerHTML = shown
+        .map(
+          (p) => `
+        <div class="search-item" data-barcode="${p.barcode}">
+          <div class="search-item-info">
+            <div class="search-item-name">${this.escapeHtml(p.name || p.barcode)}</div>
+            <div class="search-item-ref">${p.internalRef || p.barcode}</div>
+          </div>
+          <div>
+            <span class="search-item-price">${this.formatPrice(p.price)} DA</span>
+            ${p.oldPrice && p.oldPrice > p.price ? `<span class="search-item-old">${this.formatPrice(p.oldPrice)} DA</span>` : ''}
+          </div>
+        </div>
+      `
+        )
+        .join('');
+
+      this.els.searchResults.querySelectorAll('.search-item').forEach((el) => {
+        el.addEventListener('click', async () => {
+          const barcode = el.dataset.barcode;
+          await this.lookupProduct(barcode);
+          this.navigate('scan');
+          this.els.searchInput.value = '';
+          this.els.searchResults.innerHTML = '';
+          this.els.searchCount.textContent = '';
+        });
+      });
+    },
+
+    formatPrice(val) {
+      return Number(val).toLocaleString('en-US', {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      });
+    },
+
+    escapeHtml(str) {
+      const div = document.createElement('div');
+      div.textContent = str;
+      return div.innerHTML;
+    },
+
+    deferredPrompt: null,
+
+    checkInstallPrompt() {
+      window.addEventListener('beforeinstallprompt', (e) => {
+        e.preventDefault();
+        this.deferredPrompt = e;
+        const dismissed = localStorage.getItem('install_dismissed');
+        if (!dismissed) {
+          this.els.installBanner.classList.add('show');
+        }
+      });
+
+      window.addEventListener('appinstalled', () => {
+        this.els.installBanner.classList.remove('show');
+        this.deferredPrompt = null;
+        this.showToast('App installed!');
+      });
+    },
+
+    async installApp() {
+      if (!this.deferredPrompt) return;
+      this.deferredPrompt.prompt();
+      const { outcome } = await this.deferredPrompt.userChoice;
+      this.els.installBanner.classList.remove('show');
+      this.deferredPrompt = null;
+    },
+
+    dismissInstall() {
+      this.els.installBanner.classList.remove('show');
+      localStorage.setItem('install_dismissed', '1');
+    },
+
+    checkIOS() {
+      const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+      if (isIOS && !window.navigator.standalone) {
+        const dismissed = localStorage.getItem('ios_tooltip_dismissed');
+        if (!dismissed) {
+          setTimeout(() => this.els.iosTooltip.classList.add('show'), 3000);
+        }
+      }
+    },
+
+    dismissIOSTooltip() {
+      this.els.iosTooltip.classList.remove('show');
+      localStorage.setItem('ios_tooltip_dismissed', '1');
+    },
+
+    setupConnectionStatus() {
+      const banner = document.getElementById('offlineBanner');
+      if (!banner) return;
+
+      const update = () => {
+        if (navigator.onLine) {
+          banner.classList.remove('show');
+          this.updateSyncStatus('synced');
+        } else {
+          banner.classList.add('show');
+          this.updateSyncStatus('error');
+        }
+      };
+
+      window.addEventListener('online', () => {
+        update();
+        this.showToast('Back online');
+      });
+
+      window.addEventListener('offline', () => {
+        update();
+        this.showToast('You are offline');
+      });
+
+      if (!navigator.onLine) update();
+    },
+  };
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => App.init());
+  } else {
+    App.init();
+  }
+})();
+
+FILE: ../frontend/public/js/admin.js
+
+================================================================================
+(function() {
+  'use strict';
+
+  var API_BASE = (location.hostname === 'localhost')
+    ? location.protocol + '//' + location.hostname + ':3000'
+    : location.origin;
+  var API = API_BASE + '/api/v1';
+  var TOKEN_KEY = 'admin_token';
+  var STORE_KEY = 'admin_store';
+
+  var state = {
+    token: localStorage.getItem(TOKEN_KEY) || null,
+    store: null,
+    file: null
+  };
+
+  // ── Elements ──────────────────────────────────────────
+  var $authScreen   = document.getElementById('authScreen');
+  var $dashboard    = document.getElementById('dashboard');
+  var $authError    = document.getElementById('authError');
+  var $loginForm    = document.getElementById('loginForm');
+  var $signupForm   = document.getElementById('signupForm');
+  var $loginBtn     = document.getElementById('loginBtn');
+  var $signupBtn    = document.getElementById('signupBtn');
+  var $logoutBtn    = document.getElementById('logoutBtn');
+  var $dropZone     = document.getElementById('dropZone');
+  var $fileInput    = document.getElementById('fileInput');
+  var $fileSelected = document.getElementById('fileSelected');
+  var $fileName     = document.getElementById('fileName');
+  var $fileSize     = document.getElementById('fileSize');
+  var $fileRemove   = document.getElementById('fileRemove');
+  var $syncBtn      = document.getElementById('syncBtn');
+  var $syncReport   = document.getElementById('syncReport');
+  var $toast        = document.getElementById('toast');
+
+  // ── Auth Tabs ─────────────────────────────────────────
+  document.querySelectorAll('.auth-tab').forEach(function(tab) {
+    tab.addEventListener('click', function() {
+      document.querySelectorAll('.auth-tab').forEach(function(t) { t.classList.remove('active'); });
+      document.querySelectorAll('.auth-form').forEach(function(f) { f.classList.remove('active'); });
+      tab.classList.add('active');
+      var target = tab.getAttribute('data-tab');
+      document.getElementById(target + 'Form').classList.add('active');
+      $authError.classList.remove('show');
+    });
+  });
+
+  // ── Login ─────────────────────────────────────────────
+  $loginForm.addEventListener('submit', function(e) {
+    e.preventDefault();
+    $authError.classList.remove('show');
+    $loginBtn.disabled = true;
+    $loginBtn.textContent = 'Logging in...';
+
+    var email = document.getElementById('loginEmail').value.trim();
+    var password = document.getElementById('loginPassword').value;
+
+    fetch(API + '/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: email, password: password })
+    })
+    .then(function(res) { return res.json(); })
+    .then(function(data) {
+      if (data.success && data.data && data.data.token) {
+        state.token = data.data.token;
+        state.store = data.data.store || null;
+        localStorage.setItem(TOKEN_KEY, state.token);
+        if (state.store) localStorage.setItem(STORE_KEY, JSON.stringify(state.store));
+        showDashboard();
+      } else {
+        showAuthError(data.error || 'Invalid email or password');
+      }
+    })
+    .catch(function() { showAuthError('Network error. Please try again.'); })
+    .finally(function() {
+      $loginBtn.disabled = false;
+      $loginBtn.textContent = 'Log in';
+    });
+  });
+
+  // ── Signup ────────────────────────────────────────────
+  $signupForm.addEventListener('submit', function(e) {
+    e.preventDefault();
+    $authError.classList.remove('show');
+    $signupBtn.disabled = true;
+    $signupBtn.textContent = 'Creating store...';
+
+    var storeName = document.getElementById('signupStore').value.trim();
+    var email = document.getElementById('signupEmail').value.trim();
+    var password = document.getElementById('signupPassword').value;
+    var phone = document.getElementById('signupPhone').value.trim();
+
+    fetch(API + '/auth/signup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ storeName: storeName, email: email, password: password, phone: phone || undefined })
+    })
+    .then(function(res) { return res.json(); })
+    .then(function(data) {
+      if (data.success && data.data && data.data.token) {
+        state.token = data.data.token;
+        state.store = data.data.store || null;
+        localStorage.setItem(TOKEN_KEY, state.token);
+        if (state.store) localStorage.setItem(STORE_KEY, JSON.stringify(state.store));
+        showDashboard();
+      } else {
+        showAuthError(data.error || 'Could not create store. Please try again.');
+      }
+    })
+    .catch(function() { showAuthError('Network error. Please try again.'); })
+    .finally(function() {
+      $signupBtn.disabled = false;
+      $signupBtn.textContent = 'Create store';
+    });
+  });
+
+  function showAuthError(msg) {
+    $authError.textContent = msg;
+    $authError.classList.add('show');
+  }
+
+  // ── Logout ────────────────────────────────────────────
+  $logoutBtn.addEventListener('click', function() {
+    state.token = null;
+    state.store = null;
+    state.file = null;
+    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(STORE_KEY);
+    $dashboard.classList.remove('active');
+    $authScreen.style.display = '';
+    $loginForm.reset();
+    $signupForm.reset();
+    $authError.classList.remove('show');
+    clearFileUI();
+    $syncReport.classList.remove('show');
+  });
+
+  // ── Dashboard Init ────────────────────────────────────
+  function showDashboard() {
+    $authScreen.style.display = 'none';
+    $dashboard.classList.add('active');
+
+    var stored = state.store || safeParse(localStorage.getItem(STORE_KEY));
+    if (stored) {
+      state.store = stored;
+      document.getElementById('dashStoreName').textContent = stored.name || 'My Store';
+      document.getElementById('dashStoreSlug').textContent = '@' + (stored.slug || '');
+    }
+
+    loadStats();
+  }
+
+  function loadStats() {
+    if (!state.token) return;
+
+    fetch(API + '/dashboard/stats', {
+      headers: { 'Authorization': 'Bearer ' + state.token }
+    })
+    .then(function(res) { return res.json(); })
+    .then(function(data) {
+      if (data.success && data.data) {
+        var d = data.data;
+        document.getElementById('statProducts').textContent = d.totalProducts != null ? d.totalProducts : '-';
+        document.getElementById('statVersion').textContent = d.version != null ? 'v' + d.version : '-';
+
+        if (d.lastSync) {
+          var dt = new Date(d.lastSync);
+          var now = new Date();
+          var diffMin = Math.round((now - dt) / 60000);
+          if (diffMin < 1) {
+            document.getElementById('statSync').textContent = 'Just now';
+          } else if (diffMin < 60) {
+            document.getElementById('statSync').textContent = diffMin + 'm ago';
+          } else if (diffMin < 1440) {
+            document.getElementById('statSync').textContent = Math.round(diffMin / 60) + 'h ago';
+          } else {
+            document.getElementById('statSync').textContent = Math.round(diffMin / 1440) + 'd ago';
+          }
+        } else {
+          document.getElementById('statSync').textContent = 'Never';
+        }
+
+        if (stored = data.data.store) {
+          state.store = stored;
+          localStorage.setItem(STORE_KEY, JSON.stringify(stored));
+          document.getElementById('dashStoreName').textContent = stored.name || 'My Store';
+          document.getElementById('dashStoreSlug').textContent = '@' + (stored.slug || '');
+        }
+      }
+    })
+    .catch(function() {});
+  }
+
+  // ── File Selection ────────────────────────────────────
+  $dropZone.addEventListener('click', function() { $fileInput.click(); });
+
+  $dropZone.addEventListener('dragover', function(e) {
+    e.preventDefault();
+    $dropZone.classList.add('dragover');
+  });
+
+  $dropZone.addEventListener('dragleave', function() {
+    $dropZone.classList.remove('dragover');
+  });
+
+  $dropZone.addEventListener('drop', function(e) {
+    e.preventDefault();
+    $dropZone.classList.remove('dragover');
+    var files = e.dataTransfer.files;
+    if (files.length) handleFile(files[0]);
+  });
+
+  $fileInput.addEventListener('change', function() {
+    if ($fileInput.files.length) handleFile($fileInput.files[0]);
+  });
+
+  function handleFile(file) {
+    if (!file.name.toLowerCase().endsWith('.xml')) {
+      showToast('Please select an XML file');
+      return;
+    }
+    if (file.size > 10 * 1024 * 1024) {
+      showToast('File too large (max 10MB)');
+      return;
+    }
+
+    state.file = file;
+    $fileName.textContent = file.name;
+    $fileSize.textContent = formatBytes(file.size);
+    $fileSelected.classList.add('show');
+    $dropZone.style.display = 'none';
+    $syncBtn.disabled = false;
+    $syncReport.classList.remove('show');
+  }
+
+  $fileRemove.addEventListener('click', function() {
+    clearFileUI();
+    $fileInput.value = '';
+  });
+
+  function clearFileUI() {
+    state.file = null;
+    $fileSelected.classList.remove('show');
+    $dropZone.style.display = '';
+    $syncBtn.disabled = true;
+  }
+
+  // ── Sync ──────────────────────────────────────────────
+  $syncBtn.addEventListener('click', function() {
+    if (!state.file || !state.token) return;
+
+    $syncBtn.disabled = true;
+    $syncBtn.textContent = 'Syncing...';
+    $syncReport.classList.remove('show');
+
+    var formData = new FormData();
+    formData.append('file', state.file);
+
+    fetch(API + '/sync/upload', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + state.token },
+      body: formData
+    })
+    .then(function(res) { return res.json(); })
+    .then(function(data) {
+      if (data.success && data.data) {
+        showReport(data.data);
+        loadStats();
+        showToast('Sync complete!');
+      } else {
+        showToast(data.error || 'Sync failed');
+      }
+    })
+    .catch(function() { showToast('Network error during sync'); })
+    .finally(function() {
+      $syncBtn.disabled = false;
+      $syncBtn.textContent = 'Sync Products';
+    });
+  });
+
+  // ── Report ────────────────────────────────────────────
+  function showReport(result) {
+    var $icon = document.getElementById('reportIcon');
+    var $title = document.getElementById('reportTitle');
+    var hasErrors = result.errors && result.errors.length > 0;
+
+    if (hasErrors) {
+      $icon.className = 'report-icon error';
+      $icon.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>';
+      $title.textContent = 'Sync Completed with Errors';
+    } else {
+      $icon.className = 'report-icon success';
+      $icon.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+      $title.textContent = 'Sync Complete';
+    }
+
+    document.getElementById('reportImported').textContent = result.imported || 0;
+    document.getElementById('reportUpdated').textContent = result.updated || 0;
+    document.getElementById('reportNew').textContent = result['new'] || 0;
+    document.getElementById('reportSkipped').textContent = result.skipped || 0;
+
+    var $errors = document.getElementById('reportErrors');
+    var $errorList = document.getElementById('reportErrorList');
+    if (hasErrors) {
+      $errors.style.display = '';
+      $errorList.textContent = result.errors.join('\n');
+    } else {
+      $errors.style.display = 'none';
+    }
+
+    $syncReport.classList.add('show');
+  }
+
+  // ── Helpers ───────────────────────────────────────────
+  function formatBytes(b) {
+    if (b < 1024) return b + ' B';
+    if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
+    return (b / 1048576).toFixed(1) + ' MB';
+  }
+
+  function safeParse(str) {
+    try { return JSON.parse(str); } catch(e) { return null; }
+  }
+
+  function showToast(msg) {
+    $toast.textContent = msg;
+    $toast.classList.add('show');
+    setTimeout(function() { $toast.classList.remove('show'); }, 2500);
+  }
+
+  // ── Init: check existing token ────────────────────────
+  if (state.token) {
+    fetch(API + '/dashboard/stats', {
+      headers: { 'Authorization': 'Bearer ' + state.token }
+    })
+    .then(function(res) {
+      if (res.ok) return res.json();
+      throw new Error('unauthorized');
+    })
+    .then(function(data) {
+      if (data.success) showDashboard();
+      else throw new Error('bad');
+    })
+    .catch(function() {
+      state.token = null;
+      localStorage.removeItem(TOKEN_KEY);
+    });
+  }
+
+})();
+
+FILE: ../frontend/public/js/super-admin.js
+
+================================================================================
+(function() {
+  'use strict';
+
+  var API_BASE = (location.hostname === 'localhost')
+    ? location.protocol + '//' + location.hostname + ':3000'
+    : location.origin;
+  var API = API_BASE + '/api/v1';
+  var TOKEN_KEY = 'super_admin_token';
+
+  var state = {
+    token: localStorage.getItem(TOKEN_KEY) || null,
+    stores: []
+  };
+
+  // ── Elements ──
+  var $authWrap  = document.getElementById('authWrap');
+  var $dash      = document.getElementById('dash');
+  var $authError = document.getElementById('authError');
+  var $loginForm = document.getElementById('loginForm');
+  var $loginBtn  = document.getElementById('loginBtn');
+  var $logoutBtn = document.getElementById('logoutBtn');
+  var $storeList = document.getElementById('storeList');
+  var $qrModal   = document.getElementById('qrModal');
+  var $toast     = document.getElementById('toast');
+
+  // ── Auth ──
+  $loginForm.addEventListener('submit', function(e) {
+    e.preventDefault();
+    $authError.classList.remove('show');
+    $loginBtn.disabled = true;
+    $loginBtn.textContent = 'Logging in...';
+
+    var email = document.getElementById('email').value.trim();
+    var password = document.getElementById('password').value;
+
+    fetch(API + '/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: email, password: password })
+    })
+    .then(function(res) { return res.json(); })
+    .then(function(data) {
+      if (data.success && data.data && data.data.token) {
+        var store = data.data.store;
+        if (!store || store.role !== 'admin') {
+          showAuthError('This account does not have admin access');
+          return;
+        }
+        state.token = data.data.token;
+        localStorage.setItem(TOKEN_KEY, state.token);
+        showDash();
+      } else {
+        showAuthError(data.error || 'Invalid credentials');
+      }
+    })
+    .catch(function() { showAuthError('Network error'); })
+    .finally(function() {
+      $loginBtn.disabled = false;
+      $loginBtn.textContent = 'Log in';
+    });
+  });
+
+  function showAuthError(msg) {
+    $authError.textContent = msg;
+    $authError.classList.add('show');
+  }
+
+  $logoutBtn.addEventListener('click', function() {
+    state.token = null;
+    state.stores = [];
+    localStorage.removeItem(TOKEN_KEY);
+    $dash.classList.remove('active');
+    $authWrap.style.display = '';
+  });
+
+  // ── Dashboard ──
+  function showDash() {
+    $authWrap.style.display = 'none';
+    $dash.classList.add('active');
+    loadStores();
+  }
+
+  function loadStores() {
+    if (!state.token) return;
+
+    apiFetch('/admin/stores')
+      .then(function(data) {
+        if (!data.success) throw new Error(data.error);
+        state.stores = data.data || [];
+        renderStats();
+        renderStores();
+      })
+      .catch(function(err) { toast('Failed to load stores: ' + err.message); });
+  }
+
+  function renderStats() {
+    var total = state.stores.length;
+    var active = state.stores.filter(function(s) { return s.isActive; }).length;
+    var blocked = total - active;
+
+    document.getElementById('statTotal').textContent = total;
+    document.getElementById('statActive').textContent = active;
+    document.getElementById('statBlocked').textContent = blocked;
+    document.getElementById('storeCount').textContent = total + ' store' + (total !== 1 ? 's' : '');
+  }
+
+  function renderStores() {
+    $storeList.innerHTML = '';
+
+    if (state.stores.length === 0) {
+      $storeList.innerHTML = '<div style="text-align:center;color:var(--text-dim);padding:40px 0;font-size:0.875rem;">No stores yet</div>';
+      return;
+    }
+
+    state.stores.forEach(function(store) {
+      var card = document.createElement('div');
+      card.className = 'store-card' + (store.isActive ? '' : ' blocked');
+      card.setAttribute('data-id', store.id);
+
+      var statusBadge = store.isActive
+        ? '<span class="badge green">Active</span>'
+        : '<span class="badge red">Blocked</span>';
+
+      var roleBadge = store.role === 'admin'
+        ? '<span class="badge dim">Admin</span>'
+        : '<span class="badge dim">Owner</span>';
+
+      var expiryText = 'Never';
+      var expiryBadge = '';
+      if (store.expiresAt) {
+        var expDate = new Date(store.expiresAt);
+        var now = new Date();
+        if (expDate < now) {
+          expiryText = 'Expired ' + formatDate(expDate);
+          expiryBadge = '<span class="badge red">Expired</span>';
+        } else {
+          expiryText = formatDate(expDate);
+          var daysLeft = Math.ceil((expDate - now) / 86400000);
+          if (daysLeft <= 30) {
+            expiryBadge = '<span class="badge orange">' + daysLeft + 'd left</span>';
+          }
+        }
+      }
+
+      card.innerHTML =
+        '<div class="store-header">' +
+          '<div>' +
+            '<div class="store-name">' + esc(store.name) + '</div>' +
+            '<div class="store-slug">@' + esc(store.slug) + '</div>' +
+          '</div>' +
+          '<div>' + statusBadge + roleBadge + '</div>' +
+        '</div>' +
+        '<div class="store-email">' + esc(store.ownerEmail) + '</div>' +
+        '<div class="store-meta">' +
+          '<span class="badge dim">' + store.productCount + ' products</span>' +
+          '<span class="badge dim">v' + store.version + '</span>' +
+          '<span class="badge dim">Expiry: ' + expiryText + '</span>' +
+          expiryBadge +
+        '</div>' +
+        '<div class="store-actions">' +
+          (store.role !== 'admin'
+            ? '<button class="action-btn ' + (store.isActive ? 'block' : 'unblock') + '" data-action="toggle">' +
+                (store.isActive ? 'Block' : 'Unblock') + '</button>'
+            : '') +
+          (store.role !== 'admin'
+            ? '<button class="action-btn expiry" data-action="expiry">Set Expiry</button>'
+            : '') +
+          '<button class="action-btn qr" data-action="qr">QR Code</button>' +
+        '</div>' +
+        '<div class="date-input-wrap" data-expiry-form="' + store.id + '">' +
+          '<input type="date" data-expiry-date="' + store.id + '">' +
+          '<button class="set-btn" data-set-expiry="' + store.id + '">Set</button>' +
+          '<button class="clear-btn" data-clear-expiry="' + store.id + '">Clear</button>' +
+        '</div>';
+
+      $storeList.appendChild(card);
+    });
+  }
+
+  // ── Event delegation for store actions ──
+  $storeList.addEventListener('click', function(e) {
+    var btn = e.target.closest('[data-action]');
+    if (!btn) return;
+
+    var card = btn.closest('.store-card');
+    var id = parseInt(card.getAttribute('data-id'));
+    var action = btn.getAttribute('data-action');
+
+    if (action === 'toggle') toggleActive(id);
+    if (action === 'expiry') toggleExpiryForm(id);
+    if (action === 'qr') generateQR(id);
+  });
+
+  $storeList.addEventListener('click', function(e) {
+    var setBtn = e.target.closest('[data-set-expiry]');
+    if (setBtn) {
+      var id = parseInt(setBtn.getAttribute('data-set-expiry'));
+      var dateInput = document.querySelector('[data-expiry-date="' + id + '"]');
+      if (dateInput && dateInput.value) {
+        setExpiry(id, dateInput.value);
+      } else {
+        toast('Pick a date first');
+      }
+      return;
+    }
+
+    var clearBtn = e.target.closest('[data-clear-expiry]');
+    if (clearBtn) {
+      var id = parseInt(clearBtn.getAttribute('data-clear-expiry'));
+      setExpiry(id, null);
+    }
+  });
+
+  function toggleActive(id) {
+    apiFetch('/admin/stores/' + id + '/toggle-active', { method: 'PUT' })
+      .then(function(data) {
+        if (!data.success) throw new Error(data.error);
+        toast(data.data.message);
+        loadStores();
+      })
+      .catch(function(err) { toast('Error: ' + err.message); });
+  }
+
+  function toggleExpiryForm(id) {
+    var form = document.querySelector('[data-expiry-form="' + id + '"]');
+    if (form) form.classList.toggle('show');
+  }
+
+  function setExpiry(id, dateValue) {
+    apiFetch('/admin/stores/' + id + '/expiry', {
+      method: 'PUT',
+      body: JSON.stringify({ expiresAt: dateValue })
+    })
+    .then(function(data) {
+      if (!data.success) throw new Error(data.error);
+      toast(data.data.message);
+      loadStores();
+    })
+    .catch(function(err) { toast('Error: ' + err.message); });
+  }
+
+  function generateQR(id) {
+    var store = state.stores.find(function(s) { return s.id === id; });
+    if (!store) return;
+
+    apiFetch('/admin/stores/' + id + '/qr-token')
+      .then(function(data) {
+        if (!data.success) throw new Error(data.error);
+        showQRModal(store.name, data.data.customerUrl, data.data.token);
+      })
+      .catch(function(err) { toast('Error: ' + err.message); });
+  }
+
+  // ── QR Modal ──
+  function showQRModal(storeName, url, token) {
+    var fullUrl = location.origin + '/#/' + url.split('#/')[1];
+    document.getElementById('qrTitle').textContent = storeName + ' – QR Code';
+    document.getElementById('qrUrl').textContent = fullUrl;
+
+    var canvas = document.getElementById('qrCanvas');
+    if (typeof QRCode !== 'undefined') {
+      QRCode.toCanvas(canvas, fullUrl, {
+        width: 200,
+        margin: 2,
+        color: { dark: '#1a1a2e', light: '#ffffff' }
+      }, function(err) {
+        if (err) console.error('QR error:', err);
+      });
+    } else {
+      var ctx = canvas.getContext('2d');
+      canvas.width = 200;
+      canvas.height = 200;
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(0, 0, 200, 200);
+      ctx.fillStyle = '#000';
+      ctx.font = '12px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('QR Library not loaded', 100, 100);
+    }
+
+    $qrModal.classList.add('show');
+    $qrModal.setAttribute('data-url', fullUrl);
+  }
+
+  document.getElementById('qrClose').addEventListener('click', function() {
+    $qrModal.classList.remove('show');
+  });
+
+  document.getElementById('qrDownload').addEventListener('click', function() {
+    var canvas = document.getElementById('qrCanvas');
+    var link = document.createElement('a');
+    link.download = 'qr-code.png';
+    link.href = canvas.toDataURL('image/png');
+    link.click();
+    toast('QR code downloaded');
+  });
+
+  $qrModal.addEventListener('click', function(e) {
+    if (e.target === $qrModal) $qrModal.classList.remove('show');
+  });
+
+  // ── API Helper ──
+  function apiFetch(path, opts) {
+    opts = opts || {};
+    var headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});
+    if (state.token) headers['Authorization'] = 'Bearer ' + state.token;
+
+    return fetch(API + path, Object.assign({}, opts, { headers: headers }))
+      .then(function(res) { return res.json(); });
+  }
+
+  // ── Helpers ──
+  function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+  function formatDate(d) {
+    return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+  }
+
+  function toast(msg) {
+    $toast.textContent = msg;
+    $toast.classList.add('show');
+    setTimeout(function() { $toast.classList.remove('show'); }, 2500);
+  }
+
+  // ── Init ──
+  if (state.token) {
+    apiFetch('/admin/stores')
+      .then(function(data) {
+        if (data.success) showDash();
+        else throw new Error('unauthorized');
+      })
+      .catch(function() {
+        state.token = null;
+        localStorage.removeItem(TOKEN_KEY);
+      });
+  }
+})();
+
+FILE: ../frontend/public/admin.html
+
+================================================================================
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#F8F6F1">
+  <meta name="mobile-web-app-capable" content="yes">
+  <title>Store Dashboard</title>
+  <link rel="icon" type="image/svg+xml" href="/icons/favicon.svg">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #F8F6F1;
+      --surface: #FFFFFF;
+      --surface-alt: #F0EDE6;
+      --border: #E4E0D8;
+      --text-primary: #2A2824;
+      --text-secondary: #6E6A60;
+      --text-muted: #9E9A90;
+      --accent: #1A7A5C;
+      --accent-hover: #156B4F;
+      --accent-light: #E8F5EF;
+      --promotion: #D94F3B;
+      --promotion-bg: #FDF0EE;
+      --danger: #C43D2E;
+      --danger-bg: #FCEAE8;
+      --radius-sm: 8px;
+      --radius-md: 12px;
+      --radius-lg: 16px;
+      --shadow-sm: 0 1px 3px rgba(42,40,36,0.06);
+      --shadow-md: 0 4px 12px rgba(42,40,36,0.08);
+      --font: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+
+    html { font-family: var(--font); background: var(--bg); color: var(--text-primary); -webkit-font-smoothing: antialiased; }
+    body { min-height: 100dvh; }
+
+    /* AUTH SCREEN */
+    .auth-screen {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100dvh;
+      padding: 20px;
+    }
+
+    .auth-card {
+      width: 100%;
+      max-width: 400px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 32px 24px;
+      box-shadow: var(--shadow-md);
+    }
+
+    .auth-logo {
+      width: 40px;
+      height: 40px;
+      background: var(--accent);
+      border-radius: var(--radius-sm);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 20px;
+    }
+
+    .auth-logo svg { width: 20px; height: 20px; }
+
+    .auth-card h1 { font-size: 1.375rem; font-weight: 700; margin-bottom: 4px; }
+    .auth-card .subtitle { font-size: 0.875rem; color: var(--text-secondary); margin-bottom: 24px; }
+
+    .auth-tabs {
+      display: flex;
+      gap: 0;
+      margin-bottom: 24px;
+      border: 1.5px solid var(--border);
+      border-radius: var(--radius-sm);
+      overflow: hidden;
+    }
+
+    .auth-tab {
+      flex: 1;
+      padding: 10px;
+      background: none;
+      border: none;
+      font-family: var(--font);
+      font-size: 0.875rem;
+      font-weight: 600;
+      color: var(--text-secondary);
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+
+    .auth-tab.active { background: var(--accent); color: white; }
+
+    .auth-form { display: none; }
+    .auth-form.active { display: block; }
+
+    .field { margin-bottom: 16px; }
+    .field label { display: block; font-size: 0.8125rem; font-weight: 600; color: var(--text-secondary); margin-bottom: 6px; }
+    .field input {
+      width: 100%;
+      padding: 11px 14px;
+      background: var(--bg);
+      border: 1.5px solid var(--border);
+      border-radius: var(--radius-sm);
+      font-family: var(--font);
+      font-size: 0.9375rem;
+      color: var(--text-primary);
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    .field input:focus { border-color: var(--accent); }
+    .field input::placeholder { color: var(--text-muted); }
+
+    .submit-btn {
+      width: 100%;
+      padding: 12px;
+      background: var(--accent);
+      color: white;
+      border: none;
+      border-radius: var(--radius-sm);
+      font-family: var(--font);
+      font-size: 0.9375rem;
+      font-weight: 600;
+      cursor: pointer;
+      margin-top: 8px;
+      transition: background 0.15s;
+    }
+    .submit-btn:active { background: var(--accent-hover); }
+    .submit-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+
+    .auth-error {
+      background: var(--danger-bg);
+      color: var(--danger);
+      padding: 10px 14px;
+      border-radius: var(--radius-sm);
+      font-size: 0.8125rem;
+      font-weight: 500;
+      margin-bottom: 16px;
+      display: none;
+    }
+    .auth-error.show { display: block; }
+
+    /* DASHBOARD */
+    .dashboard { display: none; min-height: 100dvh; }
+    .dashboard.active { display: block; }
+
+    .dash-header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+
+    .dash-header-left { display: flex; align-items: center; gap: 12px; }
+
+    .dash-store-icon {
+      width: 36px;
+      height: 36px;
+      background: var(--accent);
+      border-radius: var(--radius-sm);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+    .dash-store-icon svg { width: 18px; height: 18px; }
+
+    .dash-store-name { font-size: 1rem; font-weight: 700; }
+    .dash-store-slug { font-size: 0.75rem; color: var(--text-muted); }
+
+    .logout-btn {
+      padding: 7px 14px;
+      background: none;
+      border: 1.5px solid var(--border);
+      border-radius: var(--radius-sm);
+      font-family: var(--font);
+      font-size: 0.8125rem;
+      font-weight: 600;
+      color: var(--text-secondary);
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .logout-btn:active { background: var(--surface-alt); }
+
+    .dash-content {
+      max-width: 640px;
+      margin: 0 auto;
+      padding: 24px 20px;
+    }
+
+    /* STATS */
+    .stats-row {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+      margin-bottom: 24px;
+    }
+
+    .stat-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 16px;
+      text-align: center;
+    }
+
+    .stat-value { font-size: 1.5rem; font-weight: 700; color: var(--text-primary); }
+    .stat-label { font-size: 0.6875rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-muted); margin-top: 4px; }
+
+    /* UPLOAD ZONE */
+    .upload-section { margin-bottom: 24px; }
+    .upload-section h2 { font-size: 1rem; font-weight: 600; margin-bottom: 12px; }
+
+    .drop-zone {
+      border: 2px dashed var(--border);
+      border-radius: var(--radius-lg);
+      padding: 40px 20px;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.2s;
+      background: var(--surface);
+    }
+
+    .drop-zone:hover, .drop-zone.dragover {
+      border-color: var(--accent);
+      background: var(--accent-light);
+    }
+
+    .drop-zone-icon { margin-bottom: 12px; color: var(--text-muted); }
+    .drop-zone-text { font-size: 0.9375rem; font-weight: 500; color: var(--text-secondary); }
+    .drop-zone-hint { font-size: 0.75rem; color: var(--text-muted); margin-top: 4px; }
+
+    .file-selected {
+      display: none;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 16px;
+      background: var(--accent-light);
+      border: 1px solid rgba(26,122,92,0.15);
+      border-radius: var(--radius-md);
+      margin-top: 12px;
+    }
+    .file-selected.show { display: flex; }
+
+    .file-info { flex: 1; }
+    .file-name { font-size: 0.875rem; font-weight: 600; }
+    .file-size { font-size: 0.75rem; color: var(--text-secondary); }
+
+    .file-remove {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      padding: 4px;
+    }
+
+    .sync-btn {
+      width: 100%;
+      padding: 14px;
+      background: var(--accent);
+      color: white;
+      border: none;
+      border-radius: var(--radius-md);
+      font-family: var(--font);
+      font-size: 0.9375rem;
+      font-weight: 600;
+      cursor: pointer;
+      margin-top: 16px;
+      transition: background 0.15s;
+    }
+    .sync-btn:active { background: var(--accent-hover); }
+    .sync-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+
+    /* SYNC REPORT */
+    .sync-report {
+      display: none;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 20px;
+      margin-top: 16px;
+      animation: slideUp 0.25s ease-out;
+    }
+    .sync-report.show { display: block; }
+
+    @keyframes slideUp {
+      from { opacity: 0; transform: translateY(12px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .report-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+
+    .report-icon {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+    .report-icon.success { background: var(--accent-light); color: var(--accent); }
+    .report-icon.error { background: var(--danger-bg); color: var(--danger); }
+
+    .report-title { font-size: 0.9375rem; font-weight: 600; }
+
+    .report-stats {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+
+    .report-stat {
+      padding: 10px 12px;
+      background: var(--bg);
+      border-radius: var(--radius-sm);
+    }
+
+    .report-stat-value { font-size: 1.125rem; font-weight: 700; }
+    .report-stat-label { font-size: 0.6875rem; color: var(--text-muted); font-weight: 500; }
+
+    .report-errors {
+      border-top: 1px solid var(--border);
+      padding-top: 12px;
+    }
+
+    .report-errors-title {
+      font-size: 0.8125rem;
+      font-weight: 600;
+      color: var(--text-secondary);
+      margin-bottom: 8px;
+    }
+
+    .report-error-list {
+      max-height: 120px;
+      overflow-y: auto;
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+      font-family: monospace;
+      line-height: 1.6;
+    }
+
+    /* TOAST */
+    .toast {
+      position: fixed;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%) translateY(20px);
+      background: var(--text-primary);
+      color: white;
+      padding: 10px 18px;
+      border-radius: 24px;
+      font-size: 0.8125rem;
+      font-weight: 500;
+      z-index: 300;
+      opacity: 0;
+      transition: transform 0.25s ease-out, opacity 0.25s;
+      pointer-events: none;
+    }
+    .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  </style>
+</head>
+<body>
+
+  <!-- =============================================
+       AUTH SCREEN
+       ============================================= -->
+  <div class="auth-screen" id="authScreen">
+    <div class="auth-card">
+      <div class="auth-logo">
+        <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 7V5a2 2 0 0 1 2-2h2"/>
+          <path d="M17 3h2a2 2 0 0 1 2 2v2"/>
+          <path d="M21 17v2a2 2 0 0 1-2 2h-2"/>
+          <path d="M7 21H5a2 2 0 0 1-2-2v-2"/>
+          <line x1="7" y1="12" x2="17" y2="12"/>
+        </svg>
+      </div>
+      <h1>Store Dashboard</h1>
+      <p class="subtitle">Manage your store products and pricing</p>
+
+      <div class="auth-error" id="authError"></div>
+
+      <div class="auth-tabs">
+        <button class="auth-tab active" data-tab="login">Log in</button>
+        <button class="auth-tab" data-tab="signup">Sign up</button>
+      </div>
+
+      <form class="auth-form active" id="loginForm">
+        <div class="field">
+          <label for="loginEmail">Email</label>
+          <input type="email" id="loginEmail" placeholder="you@example.com" required autocomplete="email">
+        </div>
+        <div class="field">
+          <label for="loginPassword">Password</label>
+          <input type="password" id="loginPassword" placeholder="Your password" required autocomplete="current-password">
+        </div>
+        <button type="submit" class="submit-btn" id="loginBtn">Log in</button>
+      </form>
+
+      <form class="auth-form" id="signupForm">
+        <div class="field">
+          <label for="signupStore">Store name</label>
+          <input type="text" id="signupStore" placeholder="e.g. Ahmed's Mini Market" required>
+        </div>
+        <div class="field">
+          <label for="signupEmail">Email</label>
+          <input type="email" id="signupEmail" placeholder="you@example.com" required autocomplete="email">
+        </div>
+        <div class="field">
+          <label for="signupPassword">Password</label>
+          <input type="password" id="signupPassword" placeholder="Min. 6 characters" required minlength="6" autocomplete="new-password">
+        </div>
+        <div class="field">
+          <label for="signupPhone">Phone <span style="color:var(--text-muted)">(optional)</span></label>
+          <input type="tel" id="signupPhone" placeholder="0555 00 00 00" autocomplete="tel">
+        </div>
+        <button type="submit" class="submit-btn" id="signupBtn">Create store</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- =============================================
+       DASHBOARD
+       ============================================= -->
+  <div class="dashboard" id="dashboard">
+    <header class="dash-header">
+      <div class="dash-header-left">
+        <div class="dash-store-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 7V5a2 2 0 0 1 2-2h2"/>
+            <path d="M17 3h2a2 2 0 0 1 2 2v2"/>
+            <path d="M21 17v2a2 2 0 0 1-2 2h-2"/>
+            <path d="M7 21H5a2 2 0 0 1-2-2v-2"/>
+            <line x1="7" y1="12" x2="17" y2="12"/>
+          </svg>
+        </div>
+        <div>
+          <div class="dash-store-name" id="dashStoreName">Loading...</div>
+          <div class="dash-store-slug" id="dashStoreSlug"></div>
+        </div>
+      </div>
+      <button class="logout-btn" id="logoutBtn">Log out</button>
+    </header>
+
+    <div class="dash-content">
+      <div class="stats-row" id="statsRow">
+        <div class="stat-card">
+          <div class="stat-value" id="statProducts">-</div>
+          <div class="stat-label">Products</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" id="statVersion">-</div>
+          <div class="stat-label">Version</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" id="statSync">-</div>
+          <div class="stat-label">Last Sync</div>
+        </div>
+      </div>
+
+      <div class="upload-section">
+        <h2>Upload Products</h2>
+        <div class="drop-zone" id="dropZone">
+          <div class="drop-zone-icon">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="17 8 12 3 7 8"/>
+              <line x1="12" y1="3" x2="12" y2="15"/>
+            </svg>
+          </div>
+          <div class="drop-zone-text">Drop XML file here or tap to browse</div>
+          <div class="drop-zone-hint">POS export file, max 10MB</div>
+        </div>
+
+        <div class="file-selected" id="fileSelected">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+          </svg>
+          <div class="file-info">
+            <div class="file-name" id="fileName"></div>
+            <div class="file-size" id="fileSize"></div>
+          </div>
+          <button class="file-remove" id="fileRemove" aria-label="Remove file">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+
+        <button class="sync-btn" id="syncBtn" disabled>Sync Products</button>
+      </div>
+
+      <div class="sync-report" id="syncReport">
+        <div class="report-header">
+          <div class="report-icon" id="reportIcon">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+          </div>
+          <div class="report-title" id="reportTitle">Sync Complete</div>
+        </div>
+        <div class="report-stats">
+          <div class="report-stat">
+            <div class="report-stat-value" id="reportImported">0</div>
+            <div class="report-stat-label">Imported</div>
+          </div>
+          <div class="report-stat">
+            <div class="report-stat-value" id="reportUpdated">0</div>
+            <div class="report-stat-label">Updated</div>
+          </div>
+          <div class="report-stat">
+            <div class="report-stat-value" id="reportNew">0</div>
+            <div class="report-stat-label">New</div>
+          </div>
+          <div class="report-stat">
+            <div class="report-stat-value" id="reportSkipped">0</div>
+            <div class="report-stat-label">Skipped</div>
+          </div>
+        </div>
+        <div class="report-errors" id="reportErrors" style="display:none;">
+          <div class="report-errors-title">Parse Errors</div>
+          <div class="report-error-list" id="reportErrorList"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <input type="file" id="fileInput" accept=".xml,text/xml,application/xml" style="display:none;">
+  <script src="/js/api.js"></script>
+  <script src="/js/admin.js"></script>
+</body>
+</html>
+
+FILE: ../frontend/public/admin-panel.html
+
+================================================================================
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#1a1a2e">
+  <title>Super Admin – Mini Market</title>
+  <link rel="icon" type="image/svg+xml" href="/icons/favicon.svg">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #0f0f1a;
+      --surface: #1a1a2e;
+      --surface-alt: #222240;
+      --border: #2d2d50;
+      --text: #e8e8f0;
+      --text-dim: #8888aa;
+      --accent: #6c63ff;
+      --accent-hover: #5a52e0;
+      --accent-light: rgba(108,99,255,0.12);
+      --green: #34d399;
+      --green-bg: rgba(52,211,153,0.12);
+      --red: #f87171;
+      --red-bg: rgba(248,113,113,0.12);
+      --orange: #fb923c;
+      --orange-bg: rgba(251,146,60,0.12);
+      --radius: 10px;
+      --font: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+    html { font-family: var(--font); background: var(--bg); color: var(--text); -webkit-font-smoothing: antialiased; }
+    body { min-height: 100dvh; }
+
+    /* AUTH */
+    .auth-wrap { display: flex; align-items: center; justify-content: center; min-height: 100dvh; padding: 20px; }
+    .auth-card {
+      width: 100%; max-width: 380px; background: var(--surface);
+      border: 1px solid var(--border); border-radius: 16px; padding: 32px 24px;
+    }
+    .auth-card h1 { font-size: 1.25rem; font-weight: 700; margin-bottom: 4px; }
+    .auth-card .sub { font-size: 0.8125rem; color: var(--text-dim); margin-bottom: 24px; }
+    .field { margin-bottom: 14px; }
+    .field label { display: block; font-size: 0.75rem; font-weight: 600; color: var(--text-dim); margin-bottom: 5px; }
+    .field input {
+      width: 100%; padding: 10px 12px; background: var(--bg);
+      border: 1.5px solid var(--border); border-radius: 8px;
+      font-family: var(--font); font-size: 0.875rem; color: var(--text); outline: none;
+    }
+    .field input:focus { border-color: var(--accent); }
+    .btn {
+      width: 100%; padding: 11px; background: var(--accent); color: white;
+      border: none; border-radius: 8px; font-family: var(--font);
+      font-size: 0.875rem; font-weight: 600; cursor: pointer; transition: background 0.15s;
+    }
+    .btn:active { background: var(--accent-hover); }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .auth-error {
+      display: none; background: var(--red-bg); color: var(--red);
+      padding: 8px 12px; border-radius: 8px; font-size: 0.8125rem; margin-bottom: 14px;
+    }
+    .auth-error.show { display: block; }
+
+    /* DASHBOARD */
+    .dash { display: none; min-height: 100dvh; }
+    .dash.active { display: block; }
+
+    .topbar {
+      background: var(--surface); border-bottom: 1px solid var(--border);
+      padding: 14px 24px; display: flex; align-items: center; justify-content: space-between;
+      position: sticky; top: 0; z-index: 100;
+    }
+    .topbar-left { display: flex; align-items: center; gap: 10px; }
+    .topbar-icon {
+      width: 32px; height: 32px; background: var(--accent);
+      border-radius: 8px; display: flex; align-items: center; justify-content: center;
+    }
+    .topbar-title { font-size: 0.9375rem; font-weight: 700; }
+    .topbar-sub { font-size: 0.6875rem; color: var(--text-dim); }
+    .logout-btn {
+      padding: 6px 12px; background: none; border: 1.5px solid var(--border);
+      border-radius: 8px; font-family: var(--font); font-size: 0.75rem;
+      font-weight: 600; color: var(--text-dim); cursor: pointer;
+    }
+    .logout-btn:active { background: var(--surface-alt); }
+
+    .content { max-width: 800px; margin: 0 auto; padding: 24px 20px; }
+
+    .stats {
+      display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 24px;
+    }
+    .stat-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 16px; text-align: center;
+    }
+    .stat-val { font-size: 1.5rem; font-weight: 700; }
+    .stat-lbl { font-size: 0.6875rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-dim); margin-top: 3px; }
+
+    .section-title { font-size: 0.875rem; font-weight: 600; margin-bottom: 12px; }
+
+    /* STORE LIST */
+    .store-list { display: flex; flex-direction: column; gap: 10px; }
+
+    .store-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 16px; transition: border-color 0.15s;
+    }
+    .store-card.blocked { border-color: var(--red); opacity: 0.7; }
+
+    .store-header {
+      display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 8px;
+    }
+    .store-name { font-size: 0.9375rem; font-weight: 600; }
+    .store-email { font-size: 0.75rem; color: var(--text-dim); }
+    .store-slug { font-size: 0.6875rem; color: var(--accent); }
+
+    .store-meta {
+      display: flex; gap: 12px; flex-wrap: wrap; margin: 8px 0;
+    }
+    .badge {
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 3px 8px; border-radius: 6px; font-size: 0.6875rem; font-weight: 600;
+    }
+    .badge.green { background: var(--green-bg); color: var(--green); }
+    .badge.red { background: var(--red-bg); color: var(--red); }
+    .badge.orange { background: var(--orange-bg); color: var(--orange); }
+    .badge.dim { background: var(--surface-alt); color: var(--text-dim); }
+
+    .store-actions {
+      display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px;
+    }
+    .action-btn {
+      padding: 6px 12px; border-radius: 6px; font-family: var(--font);
+      font-size: 0.75rem; font-weight: 600; cursor: pointer; border: none;
+      transition: opacity 0.15s;
+    }
+    .action-btn:active { opacity: 0.8; }
+    .action-btn.block { background: var(--red-bg); color: var(--red); }
+    .action-btn.unblock { background: var(--green-bg); color: var(--green); }
+    .action-btn.qr { background: var(--accent-light); color: var(--accent); }
+    .action-btn.expiry { background: var(--orange-bg); color: var(--orange); }
+
+    .date-input-wrap {
+      display: none; align-items: center; gap: 8px; margin-top: 8px;
+    }
+    .date-input-wrap.show { display: flex; }
+    .date-input-wrap input[type="date"] {
+      padding: 5px 8px; background: var(--bg); border: 1.5px solid var(--border);
+      border-radius: 6px; font-family: var(--font); font-size: 0.75rem;
+      color: var(--text); outline: none;
+    }
+    .date-input-wrap input[type="date"]:focus { border-color: var(--accent); }
+    .date-input-wrap .set-btn {
+      padding: 5px 10px; background: var(--accent); color: white;
+      border: none; border-radius: 6px; font-family: var(--font);
+      font-size: 0.75rem; font-weight: 600; cursor: pointer;
+    }
+    .date-input-wrap .clear-btn {
+      padding: 5px 10px; background: var(--surface-alt); color: var(--text-dim);
+      border: none; border-radius: 6px; font-family: var(--font);
+      font-size: 0.75rem; font-weight: 600; cursor: pointer;
+    }
+
+    /* QR MODAL */
+    .modal-overlay {
+      display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7);
+      z-index: 200; align-items: center; justify-content: center; padding: 20px;
+    }
+    .modal-overlay.show { display: flex; }
+    .modal {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 16px; padding: 24px; width: 100%; max-width: 360px;
+      text-align: center;
+    }
+    .modal h3 { font-size: 1rem; font-weight: 700; margin-bottom: 16px; }
+    .qr-canvas-wrap {
+      background: white; border-radius: 12px; padding: 16px;
+      display: inline-block; margin-bottom: 16px;
+    }
+    #qrCanvas { display: block; }
+    .qr-url {
+      font-size: 0.6875rem; color: var(--text-dim); word-break: break-all;
+      margin-bottom: 16px; max-height: 60px; overflow: hidden;
+    }
+    .modal-actions { display: flex; gap: 8px; }
+    .modal-actions .btn { flex: 1; font-size: 0.8125rem; }
+    .modal-actions .btn.secondary {
+      background: var(--surface-alt); color: var(--text-dim);
+    }
+
+    /* TOAST */
+    .toast {
+      position: fixed; bottom: 24px; left: 50%;
+      transform: translateX(-50%) translateY(20px);
+      background: var(--surface-alt); color: var(--text);
+      padding: 10px 18px; border-radius: 24px; font-size: 0.8125rem;
+      font-weight: 500; z-index: 300; opacity: 0;
+      transition: transform 0.25s ease-out, opacity 0.25s;
+      pointer-events: none; border: 1px solid var(--border);
+    }
+    .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+    @media (max-width: 480px) {
+      .stats { grid-template-columns: 1fr; }
+      .store-actions { flex-direction: column; }
+      .action-btn { width: 100%; text-align: center; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- AUTH -->
+  <div class="auth-wrap" id="authWrap">
+    <div class="auth-card">
+      <h1>Super Admin</h1>
+      <p class="sub">Mini Market management panel</p>
+      <div class="auth-error" id="authError"></div>
+      <form id="loginForm">
+        <div class="field">
+          <label>Email</label>
+          <input type="email" id="email" placeholder="admin@minimarket.com" required autocomplete="email">
+        </div>
+        <div class="field">
+          <label>Password</label>
+          <input type="password" id="password" placeholder="Password" required autocomplete="current-password">
+        </div>
+        <button type="submit" class="btn" id="loginBtn">Log in</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- DASHBOARD -->
+  <div class="dash" id="dash">
+    <header class="topbar">
+      <div class="topbar-left">
+        <div class="topbar-icon">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5" stroke-linecap="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+        </div>
+        <div>
+          <div class="topbar-title">Mini Market Admin</div>
+          <div class="topbar-sub" id="storeCount">0 stores</div>
+        </div>
+      </div>
+      <button class="logout-btn" id="logoutBtn">Log out</button>
+    </header>
+
+    <div class="content">
+      <div class="stats">
+        <div class="stat-card">
+          <div class="stat-val" id="statTotal">-</div>
+          <div class="stat-lbl">Total Stores</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-val" id="statActive">-</div>
+          <div class="stat-lbl">Active</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-val" id="statBlocked">-</div>
+          <div class="stat-lbl">Blocked</div>
+        </div>
+      </div>
+
+      <div class="section-title">All Stores</div>
+      <div class="store-list" id="storeList"></div>
+    </div>
+  </div>
+
+  <!-- QR MODAL -->
+  <div class="modal-overlay" id="qrModal">
+    <div class="modal">
+      <h3 id="qrTitle">QR Code</h3>
+      <div class="qr-canvas-wrap">
+        <canvas id="qrCanvas"></canvas>
+      </div>
+      <div class="qr-url" id="qrUrl"></div>
+      <div class="modal-actions">
+        <button class="btn secondary" id="qrClose">Close</button>
+        <button class="btn" id="qrDownload">Download PNG</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+  <script src="/js/super-admin.js"></script>
+</body>
+</html>
+
+FILE: ../docker-compose.yml
+
+================================================================================
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: mini_market
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./backend/sql:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d mini_market"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:${DB_PASSWORD:-postgres}@db:5432/mini_market
+      JWT_SECRET: ${JWT_SECRET}
+      NODE_ENV: production
+      PORT: 3000
+      RATE_LIMIT_PUBLIC: "60"
+      RATE_LIMIT_SYNC: "5"
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./frontend/public:/usr/share/nginx/html:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+FILE: ../nginx/nginx.conf
+
+================================================================================
+events {
+    worker_connections 1024;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    gzip on;
+    gzip_types text/plain text/css application/json application/javascript text/xml image/svg+xml;
+    gzip_min_length 256;
+
+    server_tokens off;
+
+    # Redirect HTTP to HTTPS
+    server {
+        listen 80;
+        server_name _;
+        return 301 https://$host$request_uri;
+    }
+
+    server {
+        listen 443 ssl http2;
+        server_name _;
+
+        ssl_certificate     /etc/nginx/ssl/cert.pem;
+        ssl_certificate_key /etc/nginx/ssl/key.pem;
+        ssl_protocols       TLSv1.2 TLSv1.3;
+        ssl_ciphers         HIGH:!aNULL:!MD5;
+
+        # Security headers
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-XSS-Protection "1; mode=block" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+        # PWA manifest
+        location = /manifest.json {
+            add_header Cache-Control "public, max-age=3600";
+            add_header Content-Type "application/manifest+json";
+        }
+
+        # Service worker
+        location = /sw.js {
+            add_header Cache-Control "no-cache";
+            add_header Content-Type "application/javascript";
+        }
+
+        # API proxy
+        location /api/ {
+            proxy_pass http://backend:3000;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_read_timeout 30s;
+            proxy_send_timeout 30s;
+
+            add_header Cache-Control "no-store";
+        }
+
+        # Health check
+        location /health {
+            proxy_pass http://backend:3000/health;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # Static files with cache
+        location / {
+            root /usr/share/nginx/html;
+            index index.html;
+            try_files $uri $uri/ /index.html;
+
+            location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|webp)$ {
+                expires 30d;
+                add_header Cache-Control "public, immutable";
+            }
+        }
+    }
+}
+FILE: ../deploy.sh
+
+================================================================================
+#!/bin/bash
+set -e
+
+echo "=== Mini-Market Price Checker Deployment ==="
+
+# Load production env
+if [ -f .env.production ]; then
+  export $(grep -v '^\s*#' .env.production | xargs)
+fi
+
+echo "1. Pulling latest code..."
+git pull origin main
+
+echo "2. Building and starting services..."
+docker compose down
+docker compose up --build -d
+
+echo "3. Waiting for backend health check..."
+for i in $(seq 1 30); do
+  if curl -sf http://localhost/health > /dev/null 2>&1; then
+    echo "   Backend is healthy!"
+    break
+  fi
+  echo "   Waiting... ($i/30)"
+  sleep 2
+done
+
+echo "4. Checking database migration..."
+docker compose exec -T backend npx drizzle-kit push
+
+echo "=== Deployment complete ==="
+echo "Backend: https://yourdomain.com/api/v1/"
+echo "Frontend: https://yourdomain.com/"
+FILE: ../scripts/backup.sh
+
+================================================================================
+#!/bin/bash
+set -e
+
+BACKUP_DIR="${BACKUP_DIR:-./backups}"
+DB_NAME="${DB_NAME:-mini_market}"
+DB_USER="${DB_USER:-postgres}"
+DB_CONTAINER="${DB_CONTAINER:-mini-market-db-1}"
+RETENTION_DAYS="${RETENTION_DAYS:-7}"
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+BACKUP_FILE="${BACKUP_DIR}/${DB_NAME}_${TIMESTAMP}.sql.gz"
+
+mkdir -p "$BACKUP_DIR"
+
+echo "Backing up database: ${DB_NAME}"
+docker compose exec -T "$DB_CONTAINER" pg_dump -U "$DB_USER" "$DB_NAME" | gzip > "$BACKUP_FILE"
+
+echo "Backup saved: ${BACKUP_FILE} ($(du -h "$BACKUP_FILE" | cut -f1))"
+
+# Clean old backups
+find "$BACKUP_DIR" -name "${DB_NAME}_*.sql.gz" -mtime +${RETENTION_DAYS} -delete
+echo "Removed backups older than ${RETENTION_DAYS} days."
+FILE: ../.env.production
+
+================================================================================
+DB_PASSWORD=change-me-in-production
+JWT_SECRET=generate-a-random-64-char-secret-here
+FRONTEND_URL=https://yourdomain.com

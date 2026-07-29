@@ -1,0 +1,1086 @@
+<!DOCTYPE html>
+<html lang="ar" dir="ltr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#F8F6F1">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="description" content="Scan barcodes to check prices instantly">
+
+  <title>Price Check</title>
+
+  <link rel="manifest" href="/manifest.json">
+  <link rel="icon" type="image/svg+xml" href="/icons/favicon.svg">
+  <link rel="apple-touch-icon" href="/icons/icon-192.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+  <style>
+    /* =============================================
+       RESET
+       ============================================= */
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    /* =============================================
+       DESIGN TOKENS
+       ============================================= */
+    :root {
+      --bg: #F8F6F1;
+      --surface: #FFFFFF;
+      --surface-alt: #F0EDE6;
+      --border: #E4E0D8;
+
+      --text-primary: #2A2824;
+      --text-secondary: #6E6A60;
+      --text-muted: #9E9A90;
+
+      --accent: #1A7A5C;
+      --accent-hover: #156B4F;
+      --accent-light: #E8F5EF;
+
+      --promotion: #D94F3B;
+      --promotion-bg: #FDF0EE;
+
+      --danger: #C43D2E;
+      --danger-bg: #FCEAE8;
+
+      --radius-sm: 8px;
+      --radius-md: 12px;
+      --radius-lg: 16px;
+      --radius-xl: 24px;
+
+      --shadow-sm: 0 1px 3px rgba(42,40,36,0.06);
+      --shadow-md: 0 4px 12px rgba(42,40,36,0.08);
+      --shadow-lg: 0 8px 24px rgba(42,40,36,0.1);
+
+      --font: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+
+      --safe-bottom: env(safe-area-inset-bottom, 0px);
+      --nav-height: 64px;
+    }
+
+    html {
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text-primary);
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    body {
+      min-height: 100dvh;
+      overflow-x: hidden;
+      padding-bottom: calc(var(--nav-height) + var(--safe-bottom) + 16px);
+    }
+
+    /* =============================================
+       TYPOGRAPHY
+       ============================================= */
+    h1 { font-size: 1.5rem; font-weight: 700; letter-spacing: -0.02em; line-height: 1.2; }
+    h2 { font-size: 1.125rem; font-weight: 600; letter-spacing: -0.01em; line-height: 1.3; }
+    h3 { font-size: 0.9375rem; font-weight: 600; line-height: 1.35; }
+    .label { font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-muted); }
+
+    /* =============================================
+           TOP BAR
+       ============================================= */
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      background: rgba(248,246,241,0.85);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      padding: 12px 20px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .topbar-inner {
+      max-width: 480px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .store-name {
+      font-size: 1rem;
+      font-weight: 700;
+      color: var(--text-primary);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 60%;
+    }
+
+    .sync-status {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      font-weight: 500;
+    }
+
+    .sync-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--accent);
+      flex-shrink: 0;
+    }
+
+    .sync-dot.stale { background: var(--text-muted); }
+    .sync-dot.error { background: var(--danger); }
+
+    /* =============================================
+           VIEWS (SPA pages)
+       ============================================= */
+    .view {
+      display: none;
+      max-width: 480px;
+      margin: 0 auto;
+      padding: 20px;
+      animation: viewIn 0.2s ease-out;
+    }
+
+    .view.active { display: block; }
+
+    @keyframes viewIn {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* =============================================
+           SCANNER VIEW
+       ============================================= */
+    .scanner-container {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 4 / 3;
+      border-radius: var(--radius-lg);
+      overflow: hidden;
+      background: #1A1A1A;
+      margin-bottom: 20px;
+    }
+
+    .scanner-container video {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .scanner-overlay {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      pointer-events: none;
+    }
+
+    .scan-frame {
+      width: 65%;
+      height: 45%;
+      border: 2px solid rgba(255,255,255,0.6);
+      border-radius: var(--radius-md);
+      position: relative;
+    }
+
+    .scan-frame::before,
+    .scan-frame::after {
+      content: '';
+      position: absolute;
+      width: 24px;
+      height: 24px;
+      border-color: var(--accent);
+      border-style: solid;
+    }
+
+    .scan-frame::before {
+      top: -1px;
+      left: -1px;
+      border-width: 3px 0 0 3px;
+      border-radius: 6px 0 0 0;
+    }
+
+    .scan-frame::after {
+      bottom: -1px;
+      right: -1px;
+      border-width: 0 3px 3px 0;
+      border-radius: 0 0 6px 0;
+    }
+
+    .scan-line {
+      position: absolute;
+      left: 5%;
+      right: 5%;
+      height: 2px;
+      background: var(--accent);
+      border-radius: 1px;
+      animation: scanLine 2s ease-in-out infinite;
+      box-shadow: 0 0 8px rgba(26,122,92,0.4);
+    }
+
+    @keyframes scanLine {
+      0%, 100% { top: 15%; opacity: 0.4; }
+      50% { top: 80%; opacity: 1; }
+    }
+
+    .scanner-btn {
+      width: 100%;
+      padding: 14px;
+      background: var(--accent);
+      color: white;
+      border: none;
+      border-radius: var(--radius-md);
+      font-family: var(--font);
+      font-size: 0.9375rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+
+    .scanner-btn:active { background: var(--accent-hover); }
+
+    .manual-input-group {
+      display: flex;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .manual-input {
+      flex: 1;
+      padding: 12px 14px;
+      background: var(--surface);
+      border: 1.5px solid var(--border);
+      border-radius: var(--radius-md);
+      font-family: var(--font);
+      font-size: 0.9375rem;
+      color: var(--text-primary);
+      outline: none;
+      transition: border-color 0.15s;
+      direction: ltr;
+      text-align: left;
+    }
+
+    .manual-input:focus { border-color: var(--accent); }
+    .manual-input::placeholder { color: var(--text-muted); }
+
+    .manual-btn {
+      padding: 12px 18px;
+      background: var(--surface);
+      border: 1.5px solid var(--border);
+      border-radius: var(--radius-md);
+      font-family: var(--font);
+      font-size: 0.875rem;
+      font-weight: 600;
+      color: var(--text-primary);
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background 0.15s;
+    }
+
+    .manual-btn:active { background: var(--surface-alt); }
+
+    /* =============================================
+           RESULT CARD
+       ============================================= */
+    .result-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 20px;
+      margin-top: 16px;
+      display: none;
+      animation: cardIn 0.25s ease-out;
+    }
+
+    .result-card.show { display: block; }
+
+    @keyframes cardIn {
+      from { opacity: 0; transform: translateY(12px) scale(0.98); }
+      to { opacity: 1; transform: translateY(0) scale(1); }
+    }
+
+    .result-ref {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      font-weight: 500;
+      margin-bottom: 4px;
+    }
+
+    .result-name {
+      font-size: 1.0625rem;
+      font-weight: 600;
+      margin-bottom: 12px;
+      line-height: 1.3;
+    }
+
+    .result-price-row {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+
+    .result-price {
+      font-size: 1.75rem;
+      font-weight: 700;
+      color: var(--accent);
+      letter-spacing: -0.02em;
+    }
+
+    .result-old-price {
+      font-size: 1rem;
+      color: var(--text-muted);
+      text-decoration: line-through;
+    }
+
+    .result-promo-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 8px;
+      background: var(--promotion-bg);
+      color: var(--promotion);
+      border-radius: 6px;
+      font-size: 0.75rem;
+      font-weight: 600;
+    }
+
+    .result-unit {
+      font-size: 0.8125rem;
+      color: var(--text-secondary);
+      margin-bottom: 16px;
+    }
+
+    .add-to-cart-btn {
+      width: 100%;
+      padding: 12px;
+      background: var(--accent);
+      color: white;
+      border: none;
+      border-radius: var(--radius-md);
+      font-family: var(--font);
+      font-size: 0.9375rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+
+    .add-to-cart-btn:active { background: var(--accent-hover); }
+
+    .not-found {
+      text-align: center;
+      padding: 32px 20px;
+      display: none;
+    }
+
+    .not-found.show { display: block; }
+
+    .not-found-icon {
+      width: 48px;
+      height: 48px;
+      border-radius: 50%;
+      background: var(--surface-alt);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 0 auto 12px;
+      font-size: 1.25rem;
+    }
+
+    .not-found h3 {
+      color: var(--text-primary);
+      margin-bottom: 4px;
+    }
+
+    .not-found p {
+      font-size: 0.875rem;
+      color: var(--text-secondary);
+    }
+
+    /* =============================================
+           SEARCH VIEW
+       ============================================= */
+    .search-input-wrap {
+      position: relative;
+      margin-bottom: 16px;
+    }
+
+    .search-icon {
+      position: absolute;
+      left: 14px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--text-muted);
+      pointer-events: none;
+    }
+
+    .search-input {
+      width: 100%;
+      padding: 12px 14px 12px 40px;
+      background: var(--surface);
+      border: 1.5px solid var(--border);
+      border-radius: var(--radius-md);
+      font-family: var(--font);
+      font-size: 0.9375rem;
+      color: var(--text-primary);
+      outline: none;
+      transition: border-color 0.15s;
+    }
+
+    .search-input:focus { border-color: var(--accent); }
+    .search-input::placeholder { color: var(--text-muted); }
+
+    .search-results {
+      display: flex;
+      flex-direction: column;
+      gap: 1px;
+    }
+
+    .search-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 0;
+      border-bottom: 1px solid var(--border);
+      cursor: pointer;
+      transition: background 0.1s;
+    }
+
+    .search-item:active { background: var(--surface-alt); margin: 0 -20px; padding: 14px 20px; }
+
+    .search-item-info { flex: 1; min-width: 0; }
+
+    .search-item-name {
+      font-size: 0.9375rem;
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .search-item-ref {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      margin-top: 2px;
+    }
+
+    .search-item-price {
+      font-size: 1rem;
+      font-weight: 700;
+      color: var(--accent);
+      white-space: nowrap;
+      margin-left: 12px;
+    }
+
+    .search-item-old {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      text-decoration: line-through;
+      margin-left: 6px;
+    }
+
+    .search-count {
+      font-size: 0.8125rem;
+      color: var(--text-muted);
+      margin-bottom: 12px;
+      font-weight: 500;
+    }
+
+    /* =============================================
+           BASKET VIEW
+       ============================================= */
+    .basket-empty {
+      text-align: center;
+      padding: 60px 20px;
+    }
+
+    .basket-empty-icon {
+      font-size: 2.5rem;
+      margin-bottom: 12px;
+      opacity: 0.3;
+    }
+
+    .basket-empty h3 {
+      color: var(--text-primary);
+      margin-bottom: 4px;
+    }
+
+    .basket-empty p {
+      font-size: 0.875rem;
+      color: var(--text-secondary);
+    }
+
+    .basket-item {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 0;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .basket-item-info { flex: 1; min-width: 0; }
+
+    .basket-item-name {
+      font-size: 0.9375rem;
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .basket-item-price {
+      font-size: 0.8125rem;
+      color: var(--text-secondary);
+      margin-top: 2px;
+    }
+
+    .basket-item-controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+
+    .qty-btn {
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
+      border: 1.5px solid var(--border);
+      background: var(--surface);
+      font-size: 1rem;
+      font-weight: 600;
+      color: var(--text-primary);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.1s;
+    }
+
+    .qty-btn:active { background: var(--surface-alt); }
+
+    .qty-btn.remove {
+      border-color: var(--danger-bg);
+      color: var(--danger);
+    }
+
+    .basket-item-qty {
+      font-size: 0.9375rem;
+      font-weight: 600;
+      min-width: 20px;
+      text-align: center;
+    }
+
+    .basket-item-subtotal {
+      font-size: 0.9375rem;
+      font-weight: 700;
+      color: var(--text-primary);
+      white-space: nowrap;
+      min-width: 60px;
+      text-align: right;
+    }
+
+    .basket-footer {
+      position: fixed;
+      bottom: calc(var(--nav-height) + var(--safe-bottom));
+      left: 0;
+      right: 0;
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      padding: 14px 20px;
+      z-index: 90;
+      display: none;
+    }
+
+    .basket-footer.show { display: block; }
+
+    .basket-footer-inner {
+      max-width: 480px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .basket-total-label {
+      font-size: 0.8125rem;
+      color: var(--text-secondary);
+      font-weight: 500;
+    }
+
+    .basket-total-value {
+      font-size: 1.375rem;
+      font-weight: 700;
+      color: var(--accent);
+      letter-spacing: -0.01em;
+    }
+
+    .basket-clear-btn {
+      padding: 8px 14px;
+      background: none;
+      border: 1.5px solid var(--danger-bg);
+      border-radius: var(--radius-sm);
+      color: var(--danger);
+      font-family: var(--font);
+      font-size: 0.8125rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+
+    .basket-clear-btn:active { background: var(--danger-bg); }
+
+    /* =============================================
+           BOTTOM NAV
+       ============================================= */
+    .bottom-nav {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      height: calc(var(--nav-height) + var(--safe-bottom));
+      padding-bottom: var(--safe-bottom);
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      display: flex;
+      z-index: 200;
+    }
+
+    .nav-item {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 3px;
+      text-decoration: none;
+      color: var(--text-muted);
+      font-size: 0.6875rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: color 0.15s;
+      -webkit-tap-highlight-color: transparent;
+      position: relative;
+    }
+
+    .nav-item.active { color: var(--accent); }
+
+    .nav-item svg { width: 22px; height: 22px; }
+
+    .nav-badge {
+      position: absolute;
+      top: 6px;
+      right: 50%;
+      transform: translateX(14px);
+      min-width: 16px;
+      height: 16px;
+      padding: 0 4px;
+      background: var(--promotion);
+      color: white;
+      border-radius: 8px;
+      font-size: 0.625rem;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      line-height: 1;
+    }
+
+    .nav-badge:empty { display: none; }
+
+    /* =============================================
+           LOADING / TOAST
+       ============================================= */
+    .loading-bar {
+      position: fixed;
+      top: 0;
+      left: 0;
+      height: 2px;
+      background: var(--accent);
+      z-index: 999;
+      transition: width 0.3s ease-out, opacity 0.3s;
+      opacity: 0;
+    }
+
+    .loading-bar.active { opacity: 1; }
+
+    .toast {
+      position: fixed;
+      bottom: calc(var(--nav-height) + var(--safe-bottom) + 16px);
+      left: 50%;
+      transform: translateX(-50%) translateY(20px);
+      background: var(--text-primary);
+      color: white;
+      padding: 10px 18px;
+      border-radius: var(--radius-xl);
+      font-size: 0.8125rem;
+      font-weight: 500;
+      z-index: 300;
+      opacity: 0;
+      transition: transform 0.25s ease-out, opacity 0.25s;
+      pointer-events: none;
+      white-space: nowrap;
+    }
+
+    .toast.show {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
+    }
+
+    /* =============================================
+           ERROR / EMPTY STATES
+       ============================================= */
+    .error-screen {
+      display: none;
+      text-align: center;
+      padding: 60px 24px;
+      max-width: 480px;
+      margin: 0 auto;
+    }
+
+    .error-screen.show { display: block; }
+
+    .error-screen h2 {
+      margin-top: 16px;
+      margin-bottom: 8px;
+    }
+
+    .error-screen p {
+      font-size: 0.875rem;
+      color: var(--text-secondary);
+      line-height: 1.5;
+    }
+
+    .error-screen .retry-btn {
+      margin-top: 20px;
+      padding: 12px 24px;
+      background: var(--accent);
+      color: white;
+      border: none;
+      border-radius: var(--radius-md);
+      font-family: var(--font);
+      font-size: 0.9375rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    /* =============================================
+           INSTALL PROMPT
+       ============================================= */
+    .install-banner {
+      background: var(--accent-light);
+      border: 1px solid rgba(26,122,92,0.15);
+      border-radius: var(--radius-md);
+      padding: 14px 16px;
+      margin-bottom: 16px;
+      display: none;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .install-banner.show { display: flex; }
+
+    .install-banner-text {
+      flex: 1;
+      font-size: 0.8125rem;
+      font-weight: 500;
+      color: var(--text-primary);
+      line-height: 1.4;
+    }
+
+    .install-banner-btn {
+      padding: 6px 12px;
+      background: var(--accent);
+      color: white;
+      border: none;
+      border-radius: var(--radius-sm);
+      font-family: var(--font);
+      font-size: 0.75rem;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    .install-banner-close {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      padding: 4px;
+    }
+
+    /* =============================================
+           iOS TOOLTIP
+       ============================================= */
+    .ios-tooltip {
+      display: none;
+      position: fixed;
+      bottom: calc(var(--nav-height) + var(--safe-bottom) + 16px);
+      right: 16px;
+      background: var(--text-primary);
+      color: white;
+      padding: 12px 16px;
+      border-radius: var(--radius-md);
+      font-size: 0.8125rem;
+      line-height: 1.4;
+      max-width: 220px;
+      z-index: 250;
+      box-shadow: var(--shadow-lg);
+    }
+
+    .ios-tooltip::after {
+      content: '';
+      position: absolute;
+      bottom: -6px;
+      right: 24px;
+      width: 12px;
+      height: 12px;
+      background: var(--text-primary);
+      transform: rotate(45deg);
+    }
+
+    .ios-tooltip button {
+      display: block;
+      margin-top: 8px;
+      background: none;
+      border: none;
+      color: rgba(255,255,255,0.7);
+      font-family: var(--font);
+      font-size: 0.75rem;
+      font-weight: 600;
+      cursor: pointer;
+      padding: 0;
+    }
+
+    /* =============================================
+       OFFLINE BANNER
+       ============================================= */
+    .offline-banner {
+      display: none;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 10px 16px;
+      background: var(--text-primary);
+      color: white;
+      font-size: 0.8125rem;
+      font-weight: 500;
+      text-align: center;
+    }
+
+    .offline-banner.show { display: flex; }
+
+    /* =============================================
+       SEARCH CLEAR BUTTON
+       ============================================= */
+    .search-clear {
+      position: absolute;
+      right: 12px;
+      top: 50%;
+      transform: translateY(-50%);
+      background: var(--surface-alt);
+      border: none;
+      border-radius: 50%;
+      width: 22px;
+      height: 22px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      color: var(--text-muted);
+      transition: color 0.15s;
+    }
+
+    .search-clear:active { color: var(--text-primary); }
+  </style>
+</head>
+<body>
+
+  <!-- =============================================
+       OFFLINE BANNER
+       ============================================= -->
+  <div class="offline-banner" id="offlineBanner">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="1" y1="1" x2="23" y2="23"/><path d="M16.72 11.06A10.94 10.94 0 0 1 19 12.55"/><path d="M5 12.55a10.94 10.94 0 0 1 5.17-2.39"/><path d="M10.71 5.05A16 16 0 0 1 22.56 9"/><path d="M1.42 9a15.91 15.91 0 0 1 4.7-2.88"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></svg>
+    You are offline — using cached data
+  </div>
+
+  <!-- =============================================
+       LOADING BAR
+       ============================================= -->
+  <div class="loading-bar" id="loadingBar"></div>
+
+  <!-- =============================================
+       TOAST
+       ============================================= -->
+  <div class="toast" id="toast"></div>
+
+  <!-- =============================================
+       TOP BAR
+       ============================================= -->
+  <header class="topbar" id="topbar" style="display:none;">
+    <div class="topbar-inner">
+      <div class="store-name" id="storeName">Loading...</div>
+      <div class="sync-status" id="syncStatus">
+        <span class="sync-dot"></span>
+        <span id="syncText">Synced</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- =============================================
+       SCANNER VIEW
+       ============================================= -->
+  <div class="view" id="view-scan" data-view="scan">
+    <div id="installBanner" class="install-banner">
+      <div class="install-banner-text">Add to home screen for quick access</div>
+      <button class="install-banner-btn" id="installBtn">Install</button>
+      <button class="install-banner-close" id="installClose" aria-label="Dismiss">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+
+    <div class="scanner-container" id="scannerContainer" style="display:none;">
+      <div id="scanner"></div>
+      <div class="scanner-overlay">
+        <div class="scan-frame">
+          <div class="scan-line"></div>
+        </div>
+      </div>
+    </div>
+
+    <button class="scanner-btn" id="scanToggle">Start Scanner</button>
+
+    <div class="manual-input-group">
+      <input class="manual-input" id="manualBarcode" type="text" inputmode="numeric" placeholder="Type barcode number..." autocomplete="off">
+      <button class="manual-btn" id="manualLookup">Look up</button>
+    </div>
+
+    <div class="result-card" id="resultCard">
+      <div class="result-ref" id="resultRef"></div>
+      <div class="result-name" id="resultName"></div>
+      <div class="result-price-row">
+        <span class="result-price" id="resultPrice"></span>
+        <span class="result-old-price" id="resultOldPrice" style="display:none;"></span>
+        <span class="result-promo-badge" id="resultPromo" style="display:none;">
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L15.09 8.26L22 9.27L17 14.14L18.18 21.02L12 17.77L5.82 21.02L7 14.14L2 9.27L8.91 8.26L12 2Z"/></svg>
+          Promo
+        </span>
+      </div>
+      <div class="result-unit" id="resultUnit"></div>
+      <button class="add-to-cart-btn" id="addToCartBtn">Add to basket</button>
+    </div>
+
+    <div class="not-found" id="notFound">
+      <div class="not-found-icon">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
+      </div>
+      <h3>Product not found</h3>
+      <p>Try scanning another barcode or type it manually above</p>
+    </div>
+  </div>
+
+  <!-- =============================================
+       SEARCH VIEW
+       ============================================= -->
+  <div class="view" id="view-search" data-view="search">
+    <div class="search-input-wrap">
+      <span class="search-icon">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+      </span>
+      <input class="search-input" id="searchInput" type="text" placeholder="Search products..." autocomplete="off">
+      <button class="search-clear" id="searchClear" aria-label="Clear search" style="display:none;">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div class="search-count" id="searchCount"></div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+
+  <!-- =============================================
+       BASKET VIEW
+       ============================================= -->
+  <div class="view" id="view-basket" data-view="basket">
+    <div id="basketContent"></div>
+  </div>
+
+  <div class="basket-footer" id="basketFooter">
+    <div class="basket-footer-inner">
+      <div>
+        <div class="basket-total-label">Total</div>
+        <div class="basket-total-value" id="basketTotal">0 DA</div>
+      </div>
+      <button class="basket-clear-btn" id="basketClearBtn">Clear</button>
+    </div>
+  </div>
+
+  <!-- =============================================
+       iOS INSTALL TOOLTIP
+       ============================================= -->
+  <div class="ios-tooltip" id="iosTooltip">
+    Tap <strong>Share</strong> then <strong>"Add to Home Screen"</strong> to install
+    <button id="iosTooltipClose">Got it</button>
+  </div>
+
+  <!-- =============================================
+       ERROR SCREEN
+       ============================================= -->
+  <div class="error-screen" id="errorScreen">
+    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+    <h2 id="errorTitle">Something went wrong</h2>
+    <p id="errorMessage">Please check your connection and try again.</p>
+    <button class="retry-btn" id="retryBtn">Try Again</button>
+  </div>
+
+  <!-- =============================================
+       BOTTOM NAV
+       ============================================= -->
+  <nav class="bottom-nav" id="bottomNav" style="display:none;">
+    <a class="nav-item active" data-nav="scan" id="navScan">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 7V5a2 2 0 0 1 2-2h2"/>
+        <path d="M17 3h2a2 2 0 0 1 2 2v2"/>
+        <path d="M21 17v2a2 2 0 0 1-2 2h-2"/>
+        <path d="M7 21H5a2 2 0 0 1-2-2v-2"/>
+        <line x1="7" y1="12" x2="17" y2="12"/>
+      </svg>
+      Scan
+    </a>
+    <a class="nav-item" data-nav="search" id="navSearch">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="11" cy="11" r="8"/>
+        <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+      </svg>
+      Search
+    </a>
+    <a class="nav-item" data-nav="basket" id="navBasket">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M6 2L3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/>
+        <line x1="3" y1="6" x2="21" y2="6"/>
+        <path d="M16 10a4 4 0 0 1-8 0"/>
+      </svg>
+      Basket
+      <span class="nav-badge" id="basketBadge"></span>
+    </a>
+  </nav>
+
+  <!-- =============================================
+       SCRIPTS
+       ============================================= -->
+  <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+  <script src="/js/db.js"></script>
+  <script src="/js/api.js"></script>
+  <script src="/js/app.js"></script>
+</body>
+</html>

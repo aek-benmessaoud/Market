@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#1a1a2e">
+  <title>Super Admin – Mini Market</title>
+  <link rel="icon" type="image/svg+xml" href="/icons/favicon.svg">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #0f0f1a;
+      --surface: #1a1a2e;
+      --surface-alt: #222240;
+      --border: #2d2d50;
+      --text: #e8e8f0;
+      --text-dim: #8888aa;
+      --accent: #6c63ff;
+      --accent-hover: #5a52e0;
+      --accent-light: rgba(108,99,255,0.12);
+      --green: #34d399;
+      --green-bg: rgba(52,211,153,0.12);
+      --red: #f87171;
+      --red-bg: rgba(248,113,113,0.12);
+      --orange: #fb923c;
+      --orange-bg: rgba(251,146,60,0.12);
+      --radius: 10px;
+      --font: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+    html { font-family: var(--font); background: var(--bg); color: var(--text); -webkit-font-smoothing: antialiased; }
+    body { min-height: 100dvh; }
+
+    /* AUTH */
+    .auth-wrap { display: flex; align-items: center; justify-content: center; min-height: 100dvh; padding: 20px; }
+    .auth-card {
+      width: 100%; max-width: 380px; background: var(--surface);
+      border: 1px solid var(--border); border-radius: 16px; padding: 32px 24px;
+    }
+    .auth-card h1 { font-size: 1.25rem; font-weight: 700; margin-bottom: 4px; }
+    .auth-card .sub { font-size: 0.8125rem; color: var(--text-dim); margin-bottom: 24px; }
+    .field { margin-bottom: 14px; }
+    .field label { display: block; font-size: 0.75rem; font-weight: 600; color: var(--text-dim); margin-bottom: 5px; }
+    .field input {
+      width: 100%; padding: 10px 12px; background: var(--bg);
+      border: 1.5px solid var(--border); border-radius: 8px;
+      font-family: var(--font); font-size: 0.875rem; color: var(--text); outline: none;
+    }
+    .field input:focus { border-color: var(--accent); }
+    .btn {
+      width: 100%; padding: 11px; background: var(--accent); color: white;
+      border: none; border-radius: 8px; font-family: var(--font);
+      font-size: 0.875rem; font-weight: 600; cursor: pointer; transition: background 0.15s;
+    }
+    .btn:active { background: var(--accent-hover); }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .auth-error {
+      display: none; background: var(--red-bg); color: var(--red);
+      padding: 8px 12px; border-radius: 8px; font-size: 0.8125rem; margin-bottom: 14px;
+    }
+    .auth-error.show { display: block; }
+
+    /* DASHBOARD */
+    .dash { display: none; min-height: 100dvh; }
+    .dash.active { display: block; }
+
+    .topbar {
+      background: var(--surface); border-bottom: 1px solid var(--border);
+      padding: 14px 24px; display: flex; align-items: center; justify-content: space-between;
+      position: sticky; top: 0; z-index: 100;
+    }
+    .topbar-left { display: flex; align-items: center; gap: 10px; }
+    .topbar-icon {
+      width: 32px; height: 32px; background: var(--accent);
+      border-radius: 8px; display: flex; align-items: center; justify-content: center;
+    }
+    .topbar-title { font-size: 0.9375rem; font-weight: 700; }
+    .topbar-sub { font-size: 0.6875rem; color: var(--text-dim); }
+    .logout-btn {
+      padding: 6px 12px; background: none; border: 1.5px solid var(--border);
+      border-radius: 8px; font-family: var(--font); font-size: 0.75rem;
+      font-weight: 600; color: var(--text-dim); cursor: pointer;
+    }
+    .logout-btn:active { background: var(--surface-alt); }
+
+    .content { max-width: 800px; margin: 0 auto; padding: 24px 20px; }
+
+    .stats {
+      display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 24px;
+    }
+    .stat-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 16px; text-align: center;
+    }
+    .stat-val { font-size: 1.5rem; font-weight: 700; }
+    .stat-lbl { font-size: 0.6875rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-dim); margin-top: 3px; }
+
+    .section-title { font-size: 0.875rem; font-weight: 600; margin-bottom: 12px; }
+
+    /* STORE LIST */
+    .store-list { display: flex; flex-direction: column; gap: 10px; }
+
+    .store-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 16px; transition: border-color 0.15s;
+    }
+    .store-card.blocked { border-color: var(--red); opacity: 0.7; }
+
+    .store-header {
+      display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 8px;
+    }
+    .store-name { font-size: 0.9375rem; font-weight: 600; }
+    .store-email { font-size: 0.75rem; color: var(--text-dim); }
+    .store-slug { font-size: 0.6875rem; color: var(--accent); }
+
+    .store-meta {
+      display: flex; gap: 12px; flex-wrap: wrap; margin: 8px 0;
+    }
+    .badge {
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 3px 8px; border-radius: 6px; font-size: 0.6875rem; font-weight: 600;
+    }
+    .badge.green { background: var(--green-bg); color: var(--green); }
+    .badge.red { background: var(--red-bg); color: var(--red); }
+    .badge.orange { background: var(--orange-bg); color: var(--orange); }
+    .badge.dim { background: var(--surface-alt); color: var(--text-dim); }
+
+    .store-actions {
+      display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px;
+    }
+    .action-btn {
+      padding: 6px 12px; border-radius: 6px; font-family: var(--font);
+      font-size: 0.75rem; font-weight: 600; cursor: pointer; border: none;
+      transition: opacity 0.15s;
+    }
+    .action-btn:active { opacity: 0.8; }
+    .action-btn.block { background: var(--red-bg); color: var(--red); }
+    .action-btn.unblock { background: var(--green-bg); color: var(--green); }
+    .action-btn.qr { background: var(--accent-light); color: var(--accent); }
+    .action-btn.expiry { background: var(--orange-bg); color: var(--orange); }
+
+    .date-input-wrap {
+      display: none; align-items: center; gap: 8px; margin-top: 8px;
+    }
+    .date-input-wrap.show { display: flex; }
+    .date-input-wrap input[type="date"] {
+      padding: 5px 8px; background: var(--bg); border: 1.5px solid var(--border);
+      border-radius: 6px; font-family: var(--font); font-size: 0.75rem;
+      color: var(--text); outline: none;
+    }
+    .date-input-wrap input[type="date"]:focus { border-color: var(--accent); }
+    .date-input-wrap .set-btn {
+      padding: 5px 10px; background: var(--accent); color: white;
+      border: none; border-radius: 6px; font-family: var(--font);
+      font-size: 0.75rem; font-weight: 600; cursor: pointer;
+    }
+    .date-input-wrap .clear-btn {
+      padding: 5px 10px; background: var(--surface-alt); color: var(--text-dim);
+      border: none; border-radius: 6px; font-family: var(--font);
+      font-size: 0.75rem; font-weight: 600; cursor: pointer;
+    }
+
+    /* QR MODAL */
+    .modal-overlay {
+      display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7);
+      z-index: 200; align-items: center; justify-content: center; padding: 20px;
+    }
+    .modal-overlay.show { display: flex; }
+    .modal {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 16px; padding: 24px; width: 100%; max-width: 360px;
+      text-align: center;
+    }
+    .modal h3 { font-size: 1rem; font-weight: 700; margin-bottom: 16px; }
+    .qr-canvas-wrap {
+      background: white; border-radius: 12px; padding: 16px;
+      display: inline-block; margin-bottom: 16px;
+    }
+    #qrCanvas { display: block; }
+    .qr-url {
+      font-size: 0.6875rem; color: var(--text-dim); word-break: break-all;
+      margin-bottom: 16px; max-height: 60px; overflow: hidden;
+    }
+    .modal-actions { display: flex; gap: 8px; }
+    .modal-actions .btn { flex: 1; font-size: 0.8125rem; }
+    .modal-actions .btn.secondary {
+      background: var(--surface-alt); color: var(--text-dim);
+    }
+
+    /* TOAST */
+    .toast {
+      position: fixed; bottom: 24px; left: 50%;
+      transform: translateX(-50%) translateY(20px);
+      background: var(--surface-alt); color: var(--text);
+      padding: 10px 18px; border-radius: 24px; font-size: 0.8125rem;
+      font-weight: 500; z-index: 300; opacity: 0;
+      transition: transform 0.25s ease-out, opacity 0.25s;
+      pointer-events: none; border: 1px solid var(--border);
+    }
+    .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+    @media (max-width: 480px) {
+      .stats { grid-template-columns: 1fr; }
+      .store-actions { flex-direction: column; }
+      .action-btn { width: 100%; text-align: center; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- AUTH -->
+  <div class="auth-wrap" id="authWrap">
+    <div class="auth-card">
+      <h1>Super Admin</h1>
+      <p class="sub">Mini Market management panel</p>
+      <div class="auth-error" id="authError"></div>
+      <form id="loginForm">
+        <div class="field">
+          <label>Email</label>
+          <input type="email" id="email" placeholder="admin@minimarket.com" required autocomplete="email">
+        </div>
+        <div class="field">
+          <label>Password</label>
+          <input type="password" id="password" placeholder="Password" required autocomplete="current-password">
+        </div>
+        <button type="submit" class="btn" id="loginBtn">Log in</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- DASHBOARD -->
+  <div class="dash" id="dash">
+    <header class="topbar">
+      <div class="topbar-left">
+        <div class="topbar-icon">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5" stroke-linecap="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+        </div>
+        <div>
+          <div class="topbar-title">Mini Market Admin</div>
+          <div class="topbar-sub" id="storeCount">0 stores</div>
+        </div>
+      </div>
+      <button class="logout-btn" id="logoutBtn">Log out</button>
+    </header>
+
+    <div class="content">
+      <div class="stats">
+        <div class="stat-card">
+          <div class="stat-val" id="statTotal">-</div>
+          <div class="stat-lbl">Total Stores</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-val" id="statActive">-</div>
+          <div class="stat-lbl">Active</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-val" id="statBlocked">-</div>
+          <div class="stat-lbl">Blocked</div>
+        </div>
+      </div>
+
+      <div class="section-title">All Stores</div>
+      <div class="store-list" id="storeList"></div>
+    </div>
+  </div>
+
+  <!-- QR MODAL -->
+  <div class="modal-overlay" id="qrModal">
+    <div class="modal">
+      <h3 id="qrTitle">QR Code</h3>
+      <div class="qr-canvas-wrap">
+        <canvas id="qrCanvas"></canvas>
+      </div>
+      <div class="qr-url" id="qrUrl"></div>
+      <div class="modal-actions">
+        <button class="btn secondary" id="qrClose">Close</button>
+        <button class="btn" id="qrDownload">Download PNG</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+  <script src="/js/super-admin.js"></script>
+</body>
+</html>

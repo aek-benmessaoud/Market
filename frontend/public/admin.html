@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#F8F6F1">
+  <meta name="mobile-web-app-capable" content="yes">
+  <title>Store Dashboard</title>
+  <link rel="icon" type="image/svg+xml" href="/icons/favicon.svg">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #F8F6F1;
+      --surface: #FFFFFF;
+      --surface-alt: #F0EDE6;
+      --border: #E4E0D8;
+      --text-primary: #2A2824;
+      --text-secondary: #6E6A60;
+      --text-muted: #9E9A90;
+      --accent: #1A7A5C;
+      --accent-hover: #156B4F;
+      --accent-light: #E8F5EF;
+      --promotion: #D94F3B;
+      --promotion-bg: #FDF0EE;
+      --danger: #C43D2E;
+      --danger-bg: #FCEAE8;
+      --radius-sm: 8px;
+      --radius-md: 12px;
+      --radius-lg: 16px;
+      --shadow-sm: 0 1px 3px rgba(42,40,36,0.06);
+      --shadow-md: 0 4px 12px rgba(42,40,36,0.08);
+      --font: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+
+    html { font-family: var(--font); background: var(--bg); color: var(--text-primary); -webkit-font-smoothing: antialiased; }
+    body { min-height: 100dvh; }
+
+    /* AUTH SCREEN */
+    .auth-screen {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100dvh;
+      padding: 20px;
+    }
+
+    .auth-card {
+      width: 100%;
+      max-width: 400px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 32px 24px;
+      box-shadow: var(--shadow-md);
+    }
+
+    .auth-logo {
+      width: 40px;
+      height: 40px;
+      background: var(--accent);
+      border-radius: var(--radius-sm);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 20px;
+    }
+
+    .auth-logo svg { width: 20px; height: 20px; }
+
+    .auth-card h1 { font-size: 1.375rem; font-weight: 700; margin-bottom: 4px; }
+    .auth-card .subtitle { font-size: 0.875rem; color: var(--text-secondary); margin-bottom: 24px; }
+
+    .auth-tabs {
+      display: flex;
+      gap: 0;
+      margin-bottom: 24px;
+      border: 1.5px solid var(--border);
+      border-radius: var(--radius-sm);
+      overflow: hidden;
+    }
+
+    .auth-tab {
+      flex: 1;
+      padding: 10px;
+      background: none;
+      border: none;
+      font-family: var(--font);
+      font-size: 0.875rem;
+      font-weight: 600;
+      color: var(--text-secondary);
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+
+    .auth-tab.active { background: var(--accent); color: white; }
+
+    .auth-form { display: none; }
+    .auth-form.active { display: block; }
+
+    .field { margin-bottom: 16px; }
+    .field label { display: block; font-size: 0.8125rem; font-weight: 600; color: var(--text-secondary); margin-bottom: 6px; }
+    .field input {
+      width: 100%;
+      padding: 11px 14px;
+      background: var(--bg);
+      border: 1.5px solid var(--border);
+      border-radius: var(--radius-sm);
+      font-family: var(--font);
+      font-size: 0.9375rem;
+      color: var(--text-primary);
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    .field input:focus { border-color: var(--accent); }
+    .field input::placeholder { color: var(--text-muted); }
+
+    .submit-btn {
+      width: 100%;
+      padding: 12px;
+      background: var(--accent);
+      color: white;
+      border: none;
+      border-radius: var(--radius-sm);
+      font-family: var(--font);
+      font-size: 0.9375rem;
+      font-weight: 600;
+      cursor: pointer;
+      margin-top: 8px;
+      transition: background 0.15s;
+    }
+    .submit-btn:active { background: var(--accent-hover); }
+    .submit-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+
+    .auth-error {
+      background: var(--danger-bg);
+      color: var(--danger);
+      padding: 10px 14px;
+      border-radius: var(--radius-sm);
+      font-size: 0.8125rem;
+      font-weight: 500;
+      margin-bottom: 16px;
+      display: none;
+    }
+    .auth-error.show { display: block; }
+
+    /* DASHBOARD */
+    .dashboard { display: none; min-height: 100dvh; }
+    .dashboard.active { display: block; }
+
+    .dash-header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+
+    .dash-header-left { display: flex; align-items: center; gap: 12px; }
+
+    .dash-store-icon {
+      width: 36px;
+      height: 36px;
+      background: var(--accent);
+      border-radius: var(--radius-sm);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+    .dash-store-icon svg { width: 18px; height: 18px; }
+
+    .dash-store-name { font-size: 1rem; font-weight: 700; }
+    .dash-store-slug { font-size: 0.75rem; color: var(--text-muted); }
+
+    .logout-btn {
+      padding: 7px 14px;
+      background: none;
+      border: 1.5px solid var(--border);
+      border-radius: var(--radius-sm);
+      font-family: var(--font);
+      font-size: 0.8125rem;
+      font-weight: 600;
+      color: var(--text-secondary);
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .logout-btn:active { background: var(--surface-alt); }
+
+    .dash-content {
+      max-width: 640px;
+      margin: 0 auto;
+      padding: 24px 20px;
+    }
+
+    /* STATS */
+    .stats-row {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+      margin-bottom: 24px;
+    }
+
+    .stat-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 16px;
+      text-align: center;
+    }
+
+    .stat-value { font-size: 1.5rem; font-weight: 700; color: var(--text-primary); }
+    .stat-label { font-size: 0.6875rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-muted); margin-top: 4px; }
+
+    /* UPLOAD ZONE */
+    .upload-section { margin-bottom: 24px; }
+    .upload-section h2 { font-size: 1rem; font-weight: 600; margin-bottom: 12px; }
+
+    .drop-zone {
+      border: 2px dashed var(--border);
+      border-radius: var(--radius-lg);
+      padding: 40px 20px;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.2s;
+      background: var(--surface);
+    }
+
+    .drop-zone:hover, .drop-zone.dragover {
+      border-color: var(--accent);
+      background: var(--accent-light);
+    }
+
+    .drop-zone-icon { margin-bottom: 12px; color: var(--text-muted); }
+    .drop-zone-text { font-size: 0.9375rem; font-weight: 500; color: var(--text-secondary); }
+    .drop-zone-hint { font-size: 0.75rem; color: var(--text-muted); margin-top: 4px; }
+
+    .file-selected {
+      display: none;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 16px;
+      background: var(--accent-light);
+      border: 1px solid rgba(26,122,92,0.15);
+      border-radius: var(--radius-md);
+      margin-top: 12px;
+    }
+    .file-selected.show { display: flex; }
+
+    .file-info { flex: 1; }
+    .file-name { font-size: 0.875rem; font-weight: 600; }
+    .file-size { font-size: 0.75rem; color: var(--text-secondary); }
+
+    .file-remove {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      padding: 4px;
+    }
+
+    .sync-btn {
+      width: 100%;
+      padding: 14px;
+      background: var(--accent);
+      color: white;
+      border: none;
+      border-radius: var(--radius-md);
+      font-family: var(--font);
+      font-size: 0.9375rem;
+      font-weight: 600;
+      cursor: pointer;
+      margin-top: 16px;
+      transition: background 0.15s;
+    }
+    .sync-btn:active { background: var(--accent-hover); }
+    .sync-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+
+    /* SYNC REPORT */
+    .sync-report {
+      display: none;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 20px;
+      margin-top: 16px;
+      animation: slideUp 0.25s ease-out;
+    }
+    .sync-report.show { display: block; }
+
+    @keyframes slideUp {
+      from { opacity: 0; transform: translateY(12px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .report-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+
+    .report-icon {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+    .report-icon.success { background: var(--accent-light); color: var(--accent); }
+    .report-icon.error { background: var(--danger-bg); color: var(--danger); }
+
+    .report-title { font-size: 0.9375rem; font-weight: 600; }
+
+    .report-stats {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+
+    .report-stat {
+      padding: 10px 12px;
+      background: var(--bg);
+      border-radius: var(--radius-sm);
+    }
+
+    .report-stat-value { font-size: 1.125rem; font-weight: 700; }
+    .report-stat-label { font-size: 0.6875rem; color: var(--text-muted); font-weight: 500; }
+
+    .report-errors {
+      border-top: 1px solid var(--border);
+      padding-top: 12px;
+    }
+
+    .report-errors-title {
+      font-size: 0.8125rem;
+      font-weight: 600;
+      color: var(--text-secondary);
+      margin-bottom: 8px;
+    }
+
+    .report-error-list {
+      max-height: 120px;
+      overflow-y: auto;
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+      font-family: monospace;
+      line-height: 1.6;
+    }
+
+    /* TOAST */
+    .toast {
+      position: fixed;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%) translateY(20px);
+      background: var(--text-primary);
+      color: white;
+      padding: 10px 18px;
+      border-radius: 24px;
+      font-size: 0.8125rem;
+      font-weight: 500;
+      z-index: 300;
+      opacity: 0;
+      transition: transform 0.25s ease-out, opacity 0.25s;
+      pointer-events: none;
+    }
+    .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  </style>
+</head>
+<body>
+
+  <!-- =============================================
+       AUTH SCREEN
+       ============================================= -->
+  <div class="auth-screen" id="authScreen">
+    <div class="auth-card">
+      <div class="auth-logo">
+        <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 7V5a2 2 0 0 1 2-2h2"/>
+          <path d="M17 3h2a2 2 0 0 1 2 2v2"/>
+          <path d="M21 17v2a2 2 0 0 1-2 2h-2"/>
+          <path d="M7 21H5a2 2 0 0 1-2-2v-2"/>
+          <line x1="7" y1="12" x2="17" y2="12"/>
+        </svg>
+      </div>
+      <h1>Store Dashboard</h1>
+      <p class="subtitle">Manage your store products and pricing</p>
+
+      <div class="auth-error" id="authError"></div>
+
+      <div class="auth-tabs">
+        <button class="auth-tab active" data-tab="login">Log in</button>
+        <button class="auth-tab" data-tab="signup">Sign up</button>
+      </div>
+
+      <form class="auth-form active" id="loginForm">
+        <div class="field">
+          <label for="loginEmail">Email</label>
+          <input type="email" id="loginEmail" placeholder="you@example.com" required autocomplete="email">
+        </div>
+        <div class="field">
+          <label for="loginPassword">Password</label>
+          <input type="password" id="loginPassword" placeholder="Your password" required autocomplete="current-password">
+        </div>
+        <button type="submit" class="submit-btn" id="loginBtn">Log in</button>
+      </form>
+
+      <form class="auth-form" id="signupForm">
+        <div class="field">
+          <label for="signupStore">Store name</label>
+          <input type="text" id="signupStore" placeholder="e.g. Ahmed's Mini Market" required>
+        </div>
+        <div class="field">
+          <label for="signupEmail">Email</label>
+          <input type="email" id="signupEmail" placeholder="you@example.com" required autocomplete="email">
+        </div>
+        <div class="field">
+          <label for="signupPassword">Password</label>
+          <input type="password" id="signupPassword" placeholder="Min. 6 characters" required minlength="6" autocomplete="new-password">
+        </div>
+        <div class="field">
+          <label for="signupPhone">Phone <span style="color:var(--text-muted)">(optional)</span></label>
+          <input type="tel" id="signupPhone" placeholder="0555 00 00 00" autocomplete="tel">
+        </div>
+        <button type="submit" class="submit-btn" id="signupBtn">Create store</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- =============================================
+       DASHBOARD
+       ============================================= -->
+  <div class="dashboard" id="dashboard">
+    <header class="dash-header">
+      <div class="dash-header-left">
+        <div class="dash-store-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 7V5a2 2 0 0 1 2-2h2"/>
+            <path d="M17 3h2a2 2 0 0 1 2 2v2"/>
+            <path d="M21 17v2a2 2 0 0 1-2 2h-2"/>
+            <path d="M7 21H5a2 2 0 0 1-2-2v-2"/>
+            <line x1="7" y1="12" x2="17" y2="12"/>
+          </svg>
+        </div>
+        <div>
+          <div class="dash-store-name" id="dashStoreName">Loading...</div>
+          <div class="dash-store-slug" id="dashStoreSlug"></div>
+        </div>
+      </div>
+      <button class="logout-btn" id="logoutBtn">Log out</button>
+    </header>
+
+    <div class="dash-content">
+      <div class="stats-row" id="statsRow">
+        <div class="stat-card">
+          <div class="stat-value" id="statProducts">-</div>
+          <div class="stat-label">Products</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" id="statVersion">-</div>
+          <div class="stat-label">Version</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" id="statSync">-</div>
+          <div class="stat-label">Last Sync</div>
+        </div>
+      </div>
+
+      <div class="upload-section">
+        <h2>Upload Products</h2>
+        <div class="drop-zone" id="dropZone">
+          <div class="drop-zone-icon">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="17 8 12 3 7 8"/>
+              <line x1="12" y1="3" x2="12" y2="15"/>
+            </svg>
+          </div>
+          <div class="drop-zone-text">Drop XML file here or tap to browse</div>
+          <div class="drop-zone-hint">POS export file, max 10MB</div>
+        </div>
+
+        <div class="file-selected" id="fileSelected">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+          </svg>
+          <div class="file-info">
+            <div class="file-name" id="fileName"></div>
+            <div class="file-size" id="fileSize"></div>
+          </div>
+          <button class="file-remove" id="fileRemove" aria-label="Remove file">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+
+        <button class="sync-btn" id="syncBtn" disabled>Sync Products</button>
+      </div>
+
+      <div class="sync-report" id="syncReport">
+        <div class="report-header">
+          <div class="report-icon" id="reportIcon">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+          </div>
+          <div class="report-title" id="reportTitle">Sync Complete</div>
+        </div>
+        <div class="report-stats">
+          <div class="report-stat">
+            <div class="report-stat-value" id="reportImported">0</div>
+            <div class="report-stat-label">Imported</div>
+          </div>
+          <div class="report-stat">
+            <div class="report-stat-value" id="reportUpdated">0</div>
+            <div class="report-stat-label">Updated</div>
+          </div>
+          <div class="report-stat">
+            <div class="report-stat-value" id="reportNew">0</div>
+            <div class="report-stat-label">New</div>
+          </div>
+          <div class="report-stat">
+            <div class="report-stat-value" id="reportSkipped">0</div>
+            <div class="report-stat-label">Skipped</div>
+          </div>
+        </div>
+        <div class="report-errors" id="reportErrors" style="display:none;">
+          <div class="report-errors-title">Parse Errors</div>
+          <div class="report-error-list" id="reportErrorList"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <input type="file" id="fileInput" accept=".xml,text/xml,application/xml" style="display:none;">
+  <script src="/js/api.js"></script>
+  <script src="/js/admin.js"></script>
+</body>
+</html>
