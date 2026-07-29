@@ -79,6 +79,16 @@ app.get('/health', (c) => {
   return c.json(successResponse({ status: 'ok', uptime: process.uptime() }));
 });
 
+// TEMP: Promote user to admin (remove after use)
+app.post('/api/v1/set-admin', async (c) => {
+  const { email, secret } = await c.req.json();
+  if (secret !== process.env.JWT_SECRET) {
+    return c.json({ success: false, error: 'Invalid secret', code: 'FORBIDDEN' }, 403);
+  }
+  const [result] = await db.update(stores).set({ role: 'admin' }).where(eq(stores.ownerEmail, email)).returning({ id: stores.id, email: stores.ownerEmail, role: stores.role });
+  return c.json({ success: true, data: result });
+});
+
 // =============================================
 // API ROUTES
 // =============================================
@@ -115,16 +125,6 @@ adminApi.route('/', adminRoutes);
 api.route('/', adminApi);
 
 app.route('/api', api);
-
-// TEMP: Promote user to admin (remove after use)
-api.post('/v1/set-admin', async (c) => {
-  const { email, secret } = await c.req.json();
-  if (secret !== process.env.JWT_SECRET) {
-    return c.json({ error: 'Invalid secret' }, 403);
-  }
-  const result = await db.update(stores).set({ role: 'admin' }).where(eq(stores.ownerEmail, email));
-  return c.json({ success: true, message: `Admin role set for ${email}` });
-});
 
 // =============================================
 // FRONTEND STATIC FILES
