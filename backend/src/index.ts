@@ -17,15 +17,12 @@ import { serve } from '@hono/node-server';
 import pino from 'pino';
 import { successResponse, errorResponse } from './utils/response.js';
 import { verifyJwt } from './middleware/auth.js';
-import { db } from './db/index.js';
 import authRoutes from './routes/auth.js';
 import storeRoutes from './routes/stores.js';
 import productRoutes from './routes/products.js';
 import dashboardRoutes from './routes/dashboard.js';
 import syncRoutes from './routes/sync.js';
 import adminRoutes from './routes/admin.js';
-import { eq } from 'drizzle-orm';
-import { stores } from './db/schema.js';
 import { readFileSync, existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join, extname } from 'path';
@@ -77,16 +74,6 @@ app.use('/api/v1/sync/*', rateLimit(60 * 1000, parseInt(process.env.RATE_LIMIT_S
 // =============================================
 app.get('/health', (c) => {
   return c.json(successResponse({ status: 'ok', uptime: process.uptime() }));
-});
-
-// TEMP: Promote user to admin (remove after use)
-app.post('/api/v1/set-admin', async (c) => {
-  const { email, secret } = await c.req.json();
-  if (secret !== process.env.JWT_SECRET) {
-    return c.json({ success: false, error: 'Invalid secret', code: 'FORBIDDEN' }, 403);
-  }
-  const [result] = await db.update(stores).set({ role: 'admin' }).where(eq(stores.ownerEmail, email)).returning({ id: stores.id, email: stores.ownerEmail, role: stores.role });
-  return c.json({ success: true, data: result });
 });
 
 // =============================================
