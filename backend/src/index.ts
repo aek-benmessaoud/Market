@@ -118,7 +118,7 @@ app.route('/api', api);
 // =============================================
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const STATIC_DIR = join(__dirname, '../../frontend/public');
+const STATIC_DIR = join(__dirname, '../frontend/public');
 const INDEX_HTML = readFileSync(join(STATIC_DIR, 'index.html'), 'utf-8');
 
 const MIME: Record<string, string> = {
