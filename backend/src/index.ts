@@ -17,12 +17,15 @@ import { serve } from '@hono/node-server';
 import pino from 'pino';
 import { successResponse, errorResponse } from './utils/response.js';
 import { verifyJwt } from './middleware/auth.js';
+import { db } from './db/index.js';
 import authRoutes from './routes/auth.js';
 import storeRoutes from './routes/stores.js';
 import productRoutes from './routes/products.js';
 import dashboardRoutes from './routes/dashboard.js';
 import syncRoutes from './routes/sync.js';
 import adminRoutes from './routes/admin.js';
+import { eq } from 'drizzle-orm';
+import { stores } from './db/schema.js';
 import { readFileSync, existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join, extname } from 'path';
@@ -113,6 +116,16 @@ api.route('/', adminApi);
 
 app.route('/api', api);
 
+// TEMP: Promote user to admin (remove after use)
+api.post('/v1/set-admin', async (c) => {
+  const { email, secret } = await c.req.json();
+  if (secret !== process.env.JWT_SECRET) {
+    return c.json({ error: 'Invalid secret' }, 403);
+  }
+  const result = await db.update(stores).set({ role: 'admin' }).where(eq(stores.ownerEmail, email));
+  return c.json({ success: true, message: `Admin role set for ${email}` });
+});
+
 // =============================================
 // FRONTEND STATIC FILES
 // =============================================
@@ -133,10 +146,17 @@ const MIME: Record<string, string> = {
 };
 
 app.get('/*', async (c) => {
+  return c.html(INDEX_HTML);
+});
+
+// =============================================
+// 404 HANDLER — serve static files or index.html
+// =============================================
+app.notFound(async (c) => {
   const path = c.req.path;
 
-  if (path === '/') {
-    return c.html(INDEX_HTML);
+  if (path.startsWith('/api/')) {
+    return c.json(errorResponse('Route not found', 'NOT_FOUND'), 404);
   }
 
   const filePath = join(STATIC_DIR, path);
@@ -149,13 +169,6 @@ app.get('/*', async (c) => {
   }
 
   return c.html(INDEX_HTML);
-});
-
-// =============================================
-// 404 HANDLER
-// =============================================
-app.notFound((c) => {
-  return c.json(errorResponse('Route not found', 'NOT_FOUND'), 404);
 });
 
 // =============================================
