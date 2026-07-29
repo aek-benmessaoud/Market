@@ -3,7 +3,6 @@ WORKDIR /app
 COPY backend/package*.json ./
 RUN npm ci
 COPY backend/ ./
-RUN npx drizzle-kit generate
 RUN npm run build
 RUN npm prune --omit=dev
 
